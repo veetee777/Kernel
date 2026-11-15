@@ -205,6 +205,11 @@ impl SecureChannel {
         self.session.set_rekey_policy(max_frames);
     }
 
+    /// Time per epoch before a rekey is due. See `Session::set_rekey_interval`.
+    pub fn set_rekey_interval(&mut self, interval: std::time::Duration) {
+        self.session.set_rekey_interval(interval);
+    }
+
     pub fn needs_rekey(&self) -> bool {
         self.session.needs_rekey()
     }
@@ -877,5 +882,29 @@ mod tests {
             got,
             vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]
         );
+    }
+
+    #[test]
+    fn time_triggered_rekey_completes_over_tcp() {
+        let (mut a, mut b) = pair();
+        a.set_rekey_interval(std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert!(a.needs_rekey(), "time trigger is due");
+        let reader = thread::spawn(move || {
+            let got: Vec<Vec<u8>> = (0..3).map(|_| b.recv().expect("recv")).collect();
+            got
+        });
+        a.send(b"one").expect("send");
+        a.rekey_if_due().expect("rekey if due");
+        a.send(b"two").expect("queued during rekey");
+        a.complete_rekey().expect("complete rekey");
+        a.send(b"three").expect("send");
+        let got = reader.join().expect("reader");
+        assert_eq!(
+            got,
+            vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]
+        );
+        // The rekey reset both triggers.
+        assert!(!a.needs_rekey());
     }
 }

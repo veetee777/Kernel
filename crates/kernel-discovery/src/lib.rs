@@ -15,6 +15,12 @@
 //!   signed with the creator's secret key, and verification checks the
 //!   signature against the public key the record claims. Announcing
 //!   another peer as yourself is a forgery, and it fails verification.
+//! - Records expire, but nothing expires them silently. [`PeerTable`]
+//!   only drops old records when the caller calls `prune` (or
+//!   `prune_stale` on a [`DiscoveryNode`]); [`DiscoveryNode::serve`]
+//!   prunes opportunistically between connections with a default TTL.
+//!   Expiry is wall-clock based, so a peer with a wrong clock can have
+//!   its records pruned early or linger past their usefulness.
 //!
 //! Nothing here is JSON and nothing touches disk. The wire format is
 //! binary, length-prefixed by [`kernel_transport`], and bounded by its
@@ -39,6 +45,10 @@ const SIGN_DOMAIN: &[u8; 11] = b"KPEER1-SIG\0";
 const BATCH_MAGIC: &[u8; 6] = b"KPEERB";
 /// Longest a discovery operation waits on a peer.
 const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a record lives before [`DiscoveryNode::serve`] prunes it
+/// opportunistically: one hour. `PeerTable::prune` takes the window
+/// explicitly, so callers that want a different TTL pass their own.
+const DEFAULT_RECORD_TTL_SECS: u64 = 3_600;
 
 /// Errors returned by discovery operations.
 #[derive(Debug)]
@@ -53,6 +63,9 @@ pub enum DiscoveryError {
     InvalidFormat(String),
     /// A record's signature did not verify against its claimed peer.
     InvalidSignature,
+    /// A record was already expired at insert time: its timestamp is
+    /// older than the window [`PeerTable::insert_with_ttl`] was given.
+    Expired,
 }
 
 impl fmt::Display for DiscoveryError {
@@ -63,6 +76,7 @@ impl fmt::Display for DiscoveryError {
             DiscoveryError::Transport(e) => write!(f, "transport error: {e}"),
             DiscoveryError::InvalidFormat(msg) => write!(f, "invalid format: {msg}"),
             DiscoveryError::InvalidSignature => write!(f, "invalid signature"),
+            DiscoveryError::Expired => write!(f, "record is already expired"),
         }
     }
 }
@@ -152,6 +166,15 @@ impl PeerRecord {
     /// When the record was made, in seconds since the Unix epoch.
     pub fn timestamp(&self) -> u64 {
         self.timestamp
+    }
+
+    /// True when this record is older than the window at `now`: the
+    /// record's timestamp plus `max_age_secs` is strictly before `now`.
+    /// A record exactly at the boundary (`timestamp + max_age == now`)
+    /// is not expired. Uses saturating addition, so a timestamp near
+    /// `u64::MAX` never wraps around and looks young.
+    pub fn is_expired(&self, now: u64, max_age_secs: u64) -> bool {
+        self.timestamp.saturating_add(max_age_secs) < now
     }
 
     /// The Ed25519 signature over the record.
@@ -344,6 +367,39 @@ impl PeerTable {
         }
     }
 
+    /// Insert a record, refusing one that is already expired at `now`.
+    /// An expired record is refused with [`DiscoveryError::Expired`]
+    /// and never stored — the expiry check runs before signature
+    /// verification, so a stale record costs no crypto work. A fresh
+    /// record behaves exactly like [`PeerTable::insert`]. This is the
+    /// only insert that knows about age; plain `insert` has no window
+    /// to judge against and never refuses on age.
+    pub fn insert_with_ttl(
+        &mut self,
+        record: PeerRecord,
+        now: u64,
+        max_age_secs: u64,
+    ) -> Result<bool, DiscoveryError> {
+        if record.is_expired(now, max_age_secs) {
+            return Err(DiscoveryError::Expired);
+        }
+        self.insert(record)
+    }
+
+    /// Drop every record older than the window at `now` — every record
+    /// with `timestamp + max_age_secs < now` — and return how many
+    /// were dropped. A record exactly at the boundary stays. The table
+    /// never prunes itself: records only leave when the caller calls
+    /// this, so a caller that wants bounded growth (for example a node
+    /// loop) must call it on a schedule. `now` is passed in; this
+    /// never reads the system clock.
+    pub fn prune(&mut self, now: u64, max_age_secs: u64) -> usize {
+        let before = self.records.len();
+        self.records
+            .retain(|_, record| !record.is_expired(now, max_age_secs));
+        before - self.records.len()
+    }
+
     /// The record held for a public key, if any.
     pub fn get(&self, key: &[u8; 32]) -> Option<&PeerRecord> {
         self.records.get(key)
@@ -500,6 +556,19 @@ impl DiscoveryNode {
         self.table.lock().unwrap().get_by_peer(peer).is_some()
     }
 
+    /// Drop every record older than `max_age_secs`, judged against the
+    /// current wall-clock time, and return how many were dropped. This
+    /// is the only place in this crate that reads the system clock for
+    /// expiry (the table itself never does). The node's own record is
+    /// stamped at bind time, so it survives as long as it is fresh.
+    /// [`DiscoveryNode::serve`] calls this opportunistically between
+    /// connections with the default TTL; callers that want a different
+    /// window or a schedule call this directly.
+    pub fn prune_stale(&self, max_age_secs: u64) -> usize {
+        let now = now_timestamp();
+        self.table.lock().unwrap().prune(now, max_age_secs)
+    }
+
     /// Exchange full tables with the peer at `addr`: send everything
     /// this node knows, then merge everything the peer sends back.
     /// A refused record on either side is skipped, never stored.
@@ -531,6 +600,10 @@ impl DiscoveryNode {
         let deadline = Instant::now() + timeout;
         let mut handled = 0;
         while handled < expected && Instant::now() < deadline {
+            // Opportunistic expiry between connections, best-effort:
+            // stale records leave on this schedule, not on a timer.
+            // Cheap (a scan of the table) and never blocks a peer.
+            self.prune_stale(DEFAULT_RECORD_TTL_SECS);
             match self.listener.accept() {
                 Ok(mut conn) => {
                     handled += 1;
@@ -643,6 +716,71 @@ mod tests {
         bytes[port_at] ^= 0x01;
         let tampered = PeerRecord::decode(&bytes).unwrap();
         assert!(tampered.verify().is_err());
+    }
+
+    #[test]
+    fn prune_drops_old_records_and_keeps_fresh_ones() {
+        let alice = Identity::generate("alice").unwrap();
+        let bob = Identity::generate("bob").unwrap();
+        let carol = Identity::generate("carol").unwrap();
+        let dave = Identity::generate("dave").unwrap();
+        let mut table = PeerTable::new();
+        // now = 1_000, window = 100: expired iff timestamp < 900.
+        table
+            .insert(PeerRecord::new(&alice, addr(7001), 100))
+            .unwrap(); // old: 100 + 100 < 1_000
+        table
+            .insert(PeerRecord::new(&bob, addr(7002), 899))
+            .unwrap(); // old: 899 + 100 < 1_000
+        table
+            .insert(PeerRecord::new(&carol, addr(7003), 900))
+            .unwrap(); // boundary: 900 + 100 == 1_000, stays
+        table
+            .insert(PeerRecord::new(&dave, addr(7004), 950))
+            .unwrap(); // fresh: 950 + 100 > 1_000
+        assert_eq!(table.prune(1_000, 100), 2);
+        assert_eq!(table.len(), 2);
+        assert!(table.get_by_peer(alice.peer_id()).is_none());
+        assert!(table.get_by_peer(bob.peer_id()).is_none());
+        assert!(table.get_by_peer(carol.peer_id()).is_some());
+        assert!(table.get_by_peer(dave.peer_id()).is_some());
+        // Pruning again drops nothing.
+        assert_eq!(table.prune(1_000, 100), 0);
+        assert_eq!(table.len(), 2);
+    }
+
+    #[test]
+    fn prune_on_an_empty_table_drops_nothing() {
+        let mut table = PeerTable::new();
+        assert_eq!(table.prune(1_000, 100), 0);
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn insert_with_ttl_refuses_expired_and_accepts_fresh() {
+        let alice = Identity::generate("alice").unwrap();
+        let bob = Identity::generate("bob").unwrap();
+        let mut table = PeerTable::new();
+        // now = 1_000, window = 100: timestamp 100 is expired.
+        let old = PeerRecord::new(&alice, addr(7001), 100);
+        assert!(matches!(
+            table.insert_with_ttl(old, 1_000, 100),
+            Err(DiscoveryError::Expired)
+        ));
+        assert!(table.is_empty());
+        // A record exactly at the boundary is fresh enough.
+        let boundary = PeerRecord::new(&alice, addr(7001), 900);
+        assert!(table.insert_with_ttl(boundary, 1_000, 100).unwrap());
+        assert_eq!(table.len(), 1);
+        // A fresh record is accepted the same as plain insert.
+        let fresh = PeerRecord::new(&bob, addr(7002), 999);
+        assert!(table.insert_with_ttl(fresh, 1_000, 100).unwrap());
+        assert_eq!(table.len(), 2);
+        // Plain insert still never refuses on age: it has no window.
+        let mut plain = PeerTable::new();
+        let ancient = PeerRecord::new(&alice, addr(7001), 1);
+        assert!(plain.insert(ancient).unwrap());
+        assert_eq!(plain.len(), 1);
     }
 
     #[test]
@@ -776,6 +914,29 @@ mod tests {
             .find(|r| r.peer() == a.peer_id())
             .unwrap();
         assert_eq!(a_record.addr(), a_addr);
+    }
+
+    #[test]
+    fn prune_stale_drops_gossiped_old_records() {
+        let a = DiscoveryNode::new(Identity::generate("alice").unwrap(), loopback()).unwrap();
+        let carol = Identity::generate("carol").unwrap();
+        // An ancient record for Carol, gossiped to A as a raw batch.
+        let old = PeerRecord::new(&carol, addr(7009), 100);
+        let a_addr = a.listen_addr().unwrap();
+        let sa = Arc::clone(&a);
+        let handle = thread::spawn(move || sa.serve(1, Duration::from_secs(10)).unwrap());
+        let mut conn = Connection::connect(a_addr).unwrap();
+        conn.send(&encode_batch(&[old])).unwrap();
+        let _ = conn.recv(); // A's reply batch
+        conn.close();
+        assert_eq!(handle.join().unwrap(), 1);
+        assert!(a.knows(carol.peer_id()));
+        // Carol's record is from timestamp 100; any sane TTL drops it.
+        assert_eq!(a.prune_stale(3_600), 1);
+        assert!(!a.knows(carol.peer_id()));
+        // Only A itself remains, and its fresh record is untouched.
+        assert_eq!(a.peer_count(), 1);
+        assert_eq!(a.prune_stale(3_600), 0);
     }
 
     #[test]

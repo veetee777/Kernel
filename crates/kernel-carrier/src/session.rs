@@ -4,6 +4,15 @@
 //! with a 16-byte tag. The 12-byte frame header is the associated data, so the
 //! frame kind and length are authenticated too.
 //!
+//! A rekey is due when EITHER trigger fires: the frame count for the epoch
+//! reaches `max_frames` (default `REKEY_AFTER_FRAMES`), or the time since the
+//! session was created or last rekeyed reaches `rekey_interval` (default
+//! `REKEY_AFTER`, 10 minutes, measured on the monotonic clock). The interval
+//! is a local policy, not negotiated with the peer: each side rekeys on its
+//! own schedule, and the peer simply answers. Nothing rekeys by itself —
+//! the owner must poll `needs_rekey()` and drive the rekey; an idle session
+//! does not rekey on its own.
+//!
 //! REKEY (initiator only). Two Rekey frames, both sealed under the keys in
 //! force when they are sent:
 //!
@@ -29,6 +38,8 @@
 //! Sequence numbers and the replay window continue across rekeys. The old keys
 //! are dropped, and zeroized, at the switch.
 
+use std::time::{Duration, Instant};
+
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
@@ -46,6 +57,8 @@ const WINDOW: u64 = 64;
 
 /// Data frames per key epoch before a rekey is due, by default.
 pub const REKEY_AFTER_FRAMES: u64 = 1 << 20;
+/// Time per key epoch before a rekey is due, by default (10 minutes).
+pub const REKEY_AFTER: Duration = Duration::from_secs(600);
 /// Payloads queued while a rekey is pending.
 pub const MAX_QUEUED: usize = 256;
 
@@ -85,6 +98,12 @@ pub struct Session {
     peer: [u8; 32],
     frames_this_epoch: u64,
     max_frames: u64,
+    /// Monotonic instant the current key epoch started (session creation
+    /// or the last rekey). Never wall clock: a clock change must not
+    /// force or delay a rekey.
+    epoch_started: Instant,
+    /// Time per epoch before a time-based rekey is due.
+    rekey_interval: Duration,
     pending: Option<Pending>,
     queued: Vec<Vec<u8>>,
 }
@@ -101,6 +120,8 @@ impl Session {
             peer,
             frames_this_epoch: 0,
             max_frames: REKEY_AFTER_FRAMES,
+            epoch_started: Instant::now(),
+            rekey_interval: REKEY_AFTER,
             pending: None,
             queued: Vec::new(),
         }
@@ -124,8 +145,29 @@ impl Session {
         self.max_frames = max_frames.max(1);
     }
 
+    /// Time per epoch before a rekey is due. Owner-tunable.
+    ///
+    /// A zero interval means the session is always due for a time-based
+    /// rekey: `needs_rekey()` returns true from creation, and true again
+    /// immediately after every rekey. Only set zero deliberately (tests,
+    /// or a caller that rekeys on every poll and accepts the cost) — a
+    /// caller that rekeys whenever `needs_rekey()` is true will rekey in
+    /// a loop with a zero interval.
+    pub fn set_rekey_interval(&mut self, interval: Duration) {
+        self.rekey_interval = interval;
+    }
+
+    /// The current time-based rekey interval.
+    pub fn rekey_interval(&self) -> Duration {
+        self.rekey_interval
+    }
+
+    /// True when a rekey is due: either the frame count for this epoch
+    /// reached `max_frames`, or the time since the epoch started
+    /// reached `rekey_interval`. A rekey resets both counters.
     pub fn needs_rekey(&self) -> bool {
         self.frames_this_epoch >= self.max_frames
+            || self.epoch_started.elapsed() >= self.rekey_interval
     }
 
     /// Seal one Data frame directly. Refused while a rekey is pending: use `send`.
@@ -235,7 +277,9 @@ impl Session {
         let (send_key, recv_key) = directional(self.role, i2r, r2i);
         self.send_key = send_key;
         self.recv_key = recv_key;
+        // A rekey resets BOTH triggers: the frame count and the epoch clock.
         self.frames_this_epoch = 0;
+        self.epoch_started = Instant::now();
     }
 
     fn seal_kind(&mut self, kind: Kind, payload: &[u8]) -> Result<Vec<u8>, CarrierError> {
@@ -644,6 +688,74 @@ mod tests {
         let response = writes(r.handle_incoming(&request).expect("answer"));
         i.handle_incoming(&response[0]).expect("complete");
         assert!(!i.needs_rekey());
+    }
+
+    #[test]
+    fn default_rekey_interval_is_ten_minutes() {
+        let (i, _) = pair();
+        assert_eq!(i.rekey_interval(), std::time::Duration::from_secs(600));
+        assert_eq!(i.rekey_interval(), REKEY_AFTER);
+    }
+
+    #[test]
+    fn time_based_rekey_triggers_after_the_interval() {
+        let (mut i, _) = pair();
+        i.set_rekey_interval(std::time::Duration::from_millis(50));
+        assert!(!i.needs_rekey(), "fresh session is not due");
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert!(i.needs_rekey(), "due once the interval has elapsed");
+    }
+
+    #[test]
+    fn frame_count_rekey_still_triggers_without_time_passing() {
+        let (mut i, _) = pair();
+        // Default interval is 10 minutes; only a few milliseconds pass
+        // here, so the frame count alone must be what trips the trigger.
+        i.set_rekey_policy(2);
+        i.send(b"x").expect("send");
+        assert!(!i.needs_rekey());
+        i.send(b"x").expect("send");
+        assert!(i.needs_rekey());
+    }
+
+    #[test]
+    fn time_triggered_rekey_completes_and_queued_payloads_arrive_once_in_order() {
+        let (mut i, mut r) = pair();
+        i.set_rekey_interval(std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert!(i.needs_rekey(), "time trigger is due");
+
+        let request = i.begin_rekey().expect("begin");
+        assert!(i.send(b"q1").expect("queue").is_empty());
+        assert!(i.send(b"q2").expect("queue").is_empty());
+        let response = writes(r.handle_incoming(&request).expect("answer"));
+        let flushed = writes(i.handle_incoming(&response[0]).expect("complete"));
+        assert_eq!(flushed.len(), 2);
+        assert_eq!(data(r.handle_incoming(&flushed[0]).expect("q1")), b"q1".to_vec());
+        assert_eq!(data(r.handle_incoming(&flushed[1]).expect("q2")), b"q2".to_vec());
+        // A flushed frame delivered again is a replay.
+        assert_eq!(
+            r.handle_incoming(&flushed[0]).err().expect("replay"),
+            CarrierError::Replay
+        );
+        // The rekey reset BOTH triggers: no frames sent since, no time elapsed.
+        assert!(!i.needs_rekey());
+        // Data still flows both ways under the new keys.
+        let after = one(i.send(b"after").expect("send"));
+        assert_eq!(data(r.handle_incoming(&after).expect("recv")), b"after".to_vec());
+    }
+
+    #[test]
+    fn zero_interval_means_always_due() {
+        let (mut i, mut r) = pair();
+        i.set_rekey_interval(std::time::Duration::ZERO);
+        assert!(i.needs_rekey(), "zero interval is due from creation");
+
+        let request = i.begin_rekey().expect("begin");
+        let response = writes(r.handle_incoming(&request).expect("answer"));
+        i.handle_incoming(&response[0]).expect("complete");
+        // Documented: a zero interval is due again immediately after a rekey.
+        assert!(i.needs_rekey());
     }
 
     #[test]

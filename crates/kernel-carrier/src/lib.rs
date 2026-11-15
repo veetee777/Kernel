@@ -10,8 +10,8 @@
 //!   the PinSet persistence tests. Two nodes handshake and exchange sealed data
 //!   over real TCP on 127.0.0.1.
 //! - Phase 2 (voice, rekeying, Hello-flood protection): VERIFIED 2026-11-14 by
-//!   Muse in this working copy: `cargo test` — 106 passed, 0 failed (96 tests
-//!   recovered from the other session + 10 new tests for the pieces below).
+//!   Muse in this working copy: `cargo test` — 112 passed, 0 failed (106
+//!   recovered/implemented tests + 6 new time-based rekey tests).
 //!   The wire protocol changed: a responder now sends a cookie challenge
 //!   before it reads a Hello, so Phase 1 nodes cannot handshake with Phase 2
 //!   nodes.
@@ -25,7 +25,8 @@
 //! Modules
 //! - `frame`: 12-byte binary header, bounded bodies. Kinds include Rekey and Cookie.
 //! - `handshake`: SIGMA-style mutual authentication, pinned keys only.
-//! - `session`: sealed Data frames, 64-entry replay window, rekeying.
+//! - `session`: sealed Data frames, 64-entry replay window, rekeying
+//!   (frame-count and time-based triggers, 10-minute default).
 //! - `pins`: pinned public keys with sticky revocation, plus binary
 //!   persistence (`KCPIN1` file format, atomic save).
 //! - `flood`: cookie challenge, proof-of-work puzzle, per-address guard.
@@ -35,7 +36,7 @@
 //! - `error`: refusal codes.
 //!
 //! Not in this crate yet: real audio codec (Opus), radio trait, multi-hop
-//! routing, discovery, time-based rekey trigger, identity hiding.
+//! routing, discovery, identity hiding.
 //!
 //! `unsafe` is forbidden crate-wide.
 

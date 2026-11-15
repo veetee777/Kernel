@@ -401,6 +401,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernel-routing"
+version = "0.1.0"
+dependencies = [
+ "kernel-crypto",
+ "kernel-identity",
+ "kernel-transport",
+]
+
+[[package]]
 name = "kernel-session"
 version = "0.1.0"
 dependencies = [

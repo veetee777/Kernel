@@ -10,9 +10,9 @@ that code is still locked behind that account's paywall.
 
 ## What exists
 
-A Cargo workspace (`resolver = "2"`) with thirty-three crates. All compile
+A Cargo workspace (`resolver = "2"`) with thirty-four crates. All compile
 with no warnings, and all tests pass (`cargo test` from this directory:
-515 tests, 0 failed).
+568 tests, 0 failed).
 
 **Foundation**
 - **`kernel-crypto`** — Ed25519 signing, X25519 key exchange,
@@ -41,8 +41,9 @@ with no warnings, and all tests pass (`cargo test` from this directory:
   put, hash-verified on open and on read. A torn final record from a
   crash is cut on replay; earlier blocks survive. No JSON, no SQLite.
   `DiskStore::compact()` rewrites the log to one record per CID
-  (atomic temp-file + rename + fsync, crash-safe); nothing calls it
-  automatically yet.
+  (atomic temp-file + rename + fsync, crash-safe). `maybe_compact`
+  and `set_auto_compact` trigger it when the log passes a size
+  threshold (and only when a duplicate exists to drop).
 
 **Networking and distribution (new)**
 - **`kernel-transport`** — Real TCP transport (std only): length-prefixed
@@ -72,9 +73,9 @@ with no warnings, and all tests pass (`cargo test` from this directory:
   window, rekeying), KCAR binary framing, TCP transport with a cookie
   challenge + proof-of-work flood guard, a pinned-peer gateway table,
   and voice (MockCodec + jitter buffer; no real codec yet). PinSet
-  persists to a binary `KCPIN1` file (atomic save). 106 tests. Not
+  persists to a binary `KCPIN1` file (atomic save). 112 tests. Not
   yet: real audio codec (Opus), radio trait, multi-hop routing,
-  discovery, time-based rekey trigger, identity hiding.
+  identity hiding.
 - **`kernel-identity-disk`** — Identity persistence: save/load an
   Ed25519 `Identity` to a binary `KIDSK1` file, 0600 permissions,
   atomic save, optional passphrase wrap (HKDF + ChaCha20-Poly1305).
@@ -85,13 +86,15 @@ with no warnings, and all tests pass (`cargo test` from this directory:
   (identity, address, timestamp, signature) gossiped over TCP.
   Bad signatures are refused and never stored; stale records never
   replace newer ones. 3-node convergence verified over loopback TCP.
-  Feeds into the DHT via `Dht::learn_discovered`; records never
-  expire.
+  Feeds into the DHT via `Dht::learn_discovered`. Records expire:
+  `PeerTable::prune` drops records older than a TTL (default 1h in
+  `serve`), and `insert_with_ttl` refuses already-expired records.
 - **`kernel-session`** — Authenticated encrypted sessions as a thin
   integration over the carrier: runs the carrier handshake/session
   over a `kernel-transport` connection. No crypto duplicated here.
-  No Hello-flood protection on this layer (the carrier's own
-  transport has it; this one doesn't).
+  Hello-flood protection: a per-IP `HandshakeLimiter` refuses
+  excess attempts before any DH work (success refunds budget);
+  the carrier's own transport has the stronger cookie challenge.
 - **`kernel-nat`** — NAT traversal: minimal STUN (RFC 5389 binding
   request/response, XOR-MAPPED-ADDRESS), UDP hole punching with a
   rendezvous registry, and a relay fallback for peers that cannot
@@ -110,8 +113,15 @@ with no warnings, and all tests pass (`cargo test` from this directory:
   calls, no on-disk state.
 - **`kernel-webui`** — Node web UI: std-only HTTP server. `GET /`
   status page, `GET /api/status`, `GET /api/blocks`,
-  `POST /api/store`, `GET /api/fetch?cid=...`. No TLS, no auth —
-  bind it to loopback unless the exposure is understood.
+  `POST /api/store`, `GET /api/fetch?cid=...`. Bearer-token auth
+  on every route (caller-supplied token, constant-time compare,
+  401 with an empty body). No TLS — bind to loopback or put TLS
+  in front.
+- **`kernel-routing`** — Multi-hop source routing: binary `KRTE1`
+  envelopes (destination + remaining route + TTL + payload),
+  operator-populated next-hop tables, TTL loop protection, local
+  delivery without forwarding. No route discovery — routes are
+  supplied, not found; forwarding is plaintext at this layer.
 
 **Apps (new)**
 - **`k-files` (K•Files)** — Named, signed files on chunked storage.
@@ -248,21 +258,24 @@ Android launcher project, not a Rust crate.
 ## What does NOT exist yet
 
 - NAT traversal exists (`kernel-nat`: STUN, hole punching, relay)
-  but is loopback-tested only — no public STUN server, no public
-  rendezvous, no real-network crossing proven. The DHT is in-memory;
-  replication and talk use explicit addresses, not DHT-discovered
-  peers, except through `Dht::learn_discovered`.
-- Persistence: `kernel-store-disk` exists (append-only log +
-  `compact()`); identity persistence exists and `Node::open`
-  loads it. Still to do: an automatic compaction trigger.
+  but is loopback-tested only — outbound UDP is blocked in this
+  VM (a real STUN query to Google's servers times out), so no
+  public STUN server, no public rendezvous, no real-network
+  crossing is proven. The DHT is in-memory; replication and talk
+  use explicit addresses, not DHT-discovered peers, except through
+  `Dht::learn_discovered`.
+- Persistence: `kernel-store-disk` exists (append-only log,
+  `compact()`, size-triggered auto-compact); identity persistence
+  exists and `Node::open` loads it.
 - The carrier's remaining pieces: real audio codec (Opus), radio
-  trait, multi-hop routing, time-based rekey trigger, identity
-  hiding.
+  trait, multi-hop routing (the routing crate exists; the carrier
+  itself has no multi-hop yet), identity hiding.
 - Atomic swaps are HTLC over a local ledger — no real chain
   interop. Smart contracts are a small custom VM — no WASM/EVM,
   no cross-contract calls, no on-disk state. Playback is proven to
   file sinks — no device audio sink, no compressed video codec,
-  no display sink. The web UI has no TLS or auth.
+  no display sink. The web UI has bearer-token auth but no TLS.
+  Routing has no route discovery.
 - Grants, docs, or any deployment.
 
 ## Project laws (enforced by design, not just words)

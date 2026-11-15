@@ -1,0 +1,11 @@
+[package]
+name = "kernel-routing"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "KERNEL multi-hop routing: source-routed message forwarding over the transport"
+
+[dependencies]
+kernel-crypto = { path = "../kernel-crypto" }
+kernel-identity = { path = "../kernel-identity" }
+kernel-transport = { path = "../kernel-transport" }

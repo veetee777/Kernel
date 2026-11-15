@@ -27,7 +27,13 @@
 //! written by an older writer before dedup landed, or appended by
 //! hand). [`DiskStore::compact`] rewrites the log with exactly one
 //! record per block, crash-safely: temp file, fsync, atomic rename,
-//! directory fsync.
+//! directory fsync. [`DiskStore::maybe_compact`] runs that rewrite
+//! only when the log exceeds a size threshold, and
+//! [`DiskStore::set_auto_compact`] arms the same check after every
+//! `put`, so a store can keep itself bounded without the caller
+//! watching it. Auto-compaction is best-effort: the block is fsync'd
+//! first, and a failed compaction never fails the put (see
+//! [`DiskStore::auto_compact_error`]).
 //!
 //! Reads seek to the indexed offset and re-verify the hash before
 //! returning bytes, so a block that rotted on disk after open is still
@@ -86,6 +92,15 @@ pub struct DiskStore {
     /// write its sibling temp file and rename it over the log.
     path: PathBuf,
     index: HashMap<Cid, (u64, u32)>,
+    /// Size threshold for automatic compaction, in bytes. `None`
+    /// (the default) disables it.
+    auto_compact: Option<u64>,
+    /// Outcome of the most recent auto-compaction that ran.
+    last_auto_compact: Option<Compaction>,
+    /// Error from the most recent auto-compaction attempt that
+    /// failed, if any. A failed auto-compaction never fails the
+    /// `put` that triggered it; the failure is recorded here.
+    auto_compact_error: Option<String>,
 }
 
 /// What [`DiskStore::compact`] did.
@@ -114,6 +129,9 @@ impl DiskStore {
             file,
             path: path.clone(),
             index,
+            auto_compact: None,
+            last_auto_compact: None,
+            auto_compact_error: None,
         })
     }
 
@@ -166,9 +184,13 @@ impl DiskStore {
 
     /// Store bytes, returning their CID. Already-stored bytes are not
     /// written again. The record is fsync'd before this returns.
+    /// If auto-compaction is armed (see [`DiskStore::set_auto_compact`]),
+    /// the size check runs after the put — including after a
+    /// duplicate put that wrote nothing.
     pub fn put(&mut self, data: &[u8]) -> Result<Cid, DiskError> {
         let cid = Cid::from_bytes(sha256(data));
         if self.index.contains_key(&cid) {
+            self.auto_compact_check();
             return Ok(cid);
         }
         let mut record = Vec::with_capacity(5 + 32 + 4 + data.len());
@@ -180,7 +202,92 @@ impl DiskStore {
         self.file.write_all(&record)?;
         self.file.sync_all()?;
         self.index.insert(cid, (offset, data.len() as u32));
+        // The block is durably stored before any compaction is
+        // attempted, so a failed auto-compaction can never lose it.
+        self.auto_compact_check();
         Ok(cid)
+    }
+
+    /// Current size of the log file in bytes, from the file's actual
+    /// metadata — so it stays true after a reopen, and reflects
+    /// compaction as well as puts. Returns 0 if the metadata cannot
+    /// be read (which does not happen for an open file handle in
+    /// practice).
+    pub fn log_len(&self) -> u64 {
+        self.file.metadata().map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Arm (or disarm) automatic compaction: after every `put`, the
+    /// store compacts itself when the log exceeds `max_log_bytes`.
+    /// Pass `None` to turn it off again (the default). Auto-compaction
+    /// is best-effort — see [`DiskStore::auto_compact_error`]. The
+    /// threshold is not persisted: a reopened store starts with
+    /// auto-compaction off, and the caller must arm it again.
+    pub fn set_auto_compact(&mut self, max_log_bytes: Option<u64>) {
+        self.auto_compact = max_log_bytes;
+    }
+
+    /// The currently armed auto-compaction threshold, if any.
+    pub fn auto_compact_threshold(&self) -> Option<u64> {
+        self.auto_compact
+    }
+
+    /// Outcome of the most recent auto-compaction that ran, if any.
+    pub fn last_auto_compaction(&self) -> Option<Compaction> {
+        self.last_auto_compact
+    }
+
+    /// Error from the most recent auto-compaction attempt that
+    /// failed, if any. Cleared by the next successful auto-compaction.
+    /// Callers that need a guarantee should call
+    /// [`DiskStore::maybe_compact`] directly instead of relying on
+    /// the trigger.
+    pub fn auto_compact_error(&self) -> Option<&str> {
+        self.auto_compact_error.as_deref()
+    }
+
+    /// Run the auto-compaction check once, if armed. Best-effort by
+    /// design: errors are recorded on the store, never returned, so a
+    /// failed compaction can never fail the `put` that triggered it.
+    fn auto_compact_check(&mut self) {
+        let Some(max) = self.auto_compact else {
+            return;
+        };
+        match self.maybe_compact(max) {
+            Ok(Some(done)) => {
+                self.last_auto_compact = Some(done);
+                self.auto_compact_error = None;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                self.auto_compact_error = Some(e.to_string());
+            }
+        }
+    }
+
+    /// Compact only when the log exceeds `max_log_bytes`, returning
+    /// `Some(compaction)` when it ran and `None` when it did not.
+    ///
+    /// The size condition is necessary but not sufficient: the rewrite
+    /// is skipped when the log holds no duplicate records, because
+    /// rewriting a duplicate-free log saves 0 bytes and only costs a
+    /// full rewrite. A log with no duplicates cannot shrink, so it is
+    /// left alone even over threshold.
+    ///
+    /// A threshold of 0 means "always compact when there is anything
+    /// to drop": any non-empty log exceeds 0 bytes, so the only gate
+    /// left is whether a duplicate exists. On an empty store this
+    /// returns `None` — compacting an empty store is never an error.
+    pub fn maybe_compact(&mut self, max_log_bytes: u64) -> Result<Option<Compaction>, DiskError> {
+        if self.log_len() <= max_log_bytes {
+            return Ok(None);
+        }
+        // More records than blocks means at least one duplicate.
+        let records = Self::count_records(&mut self.file)?;
+        if records <= self.index.len() as u64 {
+            return Ok(None);
+        }
+        Ok(Some(self.compact()?))
     }
 
     /// Fetch bytes by CID. `Ok(None)` if the block is not held.
@@ -285,8 +392,10 @@ impl DiskStore {
     ///
     /// This needs exclusive access: no other reader or writer may use
     /// this store (or the same directory) while it runs, because the
-    /// file handle and the index are swapped for the new log. Nothing
-    /// calls this automatically — the caller decides when to compact.
+    /// file handle and the index are swapped for the new log. Callers
+    /// that want this to happen on its own should use
+    /// [`DiskStore::maybe_compact`] or [`DiskStore::set_auto_compact`];
+    /// this method itself never runs unless called.
     pub fn compact(&mut self) -> Result<Compaction, DiskError> {
         let result = self.compact_inner();
         if result.is_err() {
@@ -647,6 +756,210 @@ mod tests {
         assert_eq!(reopened.get(&cid_a).unwrap().unwrap(), b"alpha block");
         assert_eq!(reopened.get(&cid_b).unwrap().unwrap(), b"beta block");
         assert_eq!(reopened.get(&cid_c).unwrap().unwrap(), b"gamma block");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn log_len_tracks_puts_and_compaction() {
+        let dir = test_dir("log-len");
+        let mut store = DiskStore::open(&dir).unwrap();
+        assert_eq!(store.log_len(), 0);
+        store.put(b"alpha block").unwrap(); // 41 + 11 = 52 bytes
+        assert_eq!(store.log_len(), 52);
+        store.put(b"beta block").unwrap(); // 41 + 10 = 51 bytes
+        assert_eq!(store.log_len(), 103);
+        // A duplicate put writes nothing, so the length does not move.
+        store.put(b"alpha block").unwrap();
+        assert_eq!(store.log_len(), 103);
+        // Hand-appended duplicates grow the log; compaction shrinks it.
+        append_raw_record(&dir, b"alpha block");
+        append_raw_record(&dir, b"beta block");
+        let mut store = DiskStore::open(&dir).unwrap();
+        assert_eq!(store.log_len(), 103 + 52 + 51);
+        store.compact().unwrap();
+        assert_eq!(store.log_len(), 103);
+        // The length stays true after a reopen.
+        drop(store);
+        let reopened = DiskStore::open(&dir).unwrap();
+        assert_eq!(reopened.log_len(), 103);
+        assert_eq!(reopened.log_len(), log_len(&dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn maybe_compact_under_threshold_returns_none_and_changes_nothing() {
+        let dir = test_dir("maybe-under");
+        let mut store = DiskStore::open(&dir).unwrap();
+        let cid_a = store.put(b"alpha block").unwrap();
+        let cid_b = store.put(b"beta block").unwrap();
+        let size_before = store.log_len();
+        assert_eq!(store.maybe_compact(1_000_000).unwrap(), None);
+        assert_eq!(store.log_len(), size_before);
+        assert_eq!(store.get(&cid_a).unwrap().unwrap(), b"alpha block");
+        assert_eq!(store.get(&cid_b).unwrap().unwrap(), b"beta block");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn maybe_compact_over_threshold_compacts_and_keeps_every_block() {
+        let dir = test_dir("maybe-over");
+        let cid_a;
+        let cid_b;
+        {
+            let mut store = DiskStore::open(&dir).unwrap();
+            cid_a = store.put(b"alpha block").unwrap();
+            cid_b = store.put(b"beta block").unwrap();
+        }
+        append_raw_record(&dir, b"alpha block");
+        let mut store = DiskStore::open(&dir).unwrap();
+        assert_eq!(store.log_len(), 103 + 52);
+        let done = store.maybe_compact(10).unwrap();
+        let done = done.expect("over threshold with a duplicate must run");
+        assert_eq!(done.dropped, 1);
+        assert_eq!(done.bytes_saved, 52);
+        assert_eq!(store.log_len(), 103);
+        assert_eq!(store.get(&cid_a).unwrap().unwrap(), b"alpha block");
+        assert_eq!(store.get(&cid_b).unwrap().unwrap(), b"beta block");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn maybe_compact_threshold_zero_means_compact_when_anything_to_drop() {
+        let dir = test_dir("maybe-zero");
+        // Empty store: never an error, never a run.
+        let mut store = DiskStore::open(&dir).unwrap();
+        assert_eq!(store.maybe_compact(0).unwrap(), None);
+        // With a duplicate present, threshold 0 always fires.
+        store.put(b"alpha block").unwrap();
+        store.put(b"beta block").unwrap();
+        append_raw_record(&dir, b"alpha block");
+        drop(store);
+        let mut store = DiskStore::open(&dir).unwrap();
+        let done = store.maybe_compact(0).unwrap();
+        assert_eq!(done.expect("duplicate present").dropped, 1);
+        // Nothing left to drop: threshold 0 now returns None instead
+        // of rewriting a duplicate-free log on every call.
+        assert_eq!(store.maybe_compact(0).unwrap(), None);
+        assert_eq!(store.log_len(), 103);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn maybe_compact_over_threshold_without_duplicates_leaves_log_alone() {
+        let dir = test_dir("maybe-nodup");
+        let mut store = DiskStore::open(&dir).unwrap();
+        let cid_a = store.put(b"alpha block").unwrap();
+        store.put(b"beta block").unwrap();
+        // Over threshold, but rewriting would save 0 bytes: skipped.
+        assert_eq!(store.maybe_compact(10).unwrap(), None);
+        assert_eq!(store.log_len(), 103);
+        assert_eq!(store.get(&cid_a).unwrap().unwrap(), b"alpha block");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_compact_keeps_log_bounded_and_survives_restart() {
+        let dir = test_dir("auto-on");
+        let mut store = DiskStore::open(&dir).unwrap();
+        assert_eq!(store.auto_compact_threshold(), None);
+        assert_eq!(store.last_auto_compaction(), None);
+        store.set_auto_compact(Some(120));
+        assert_eq!(store.auto_compact_threshold(), Some(120));
+        let cid_a = store.put(b"alpha block").unwrap();
+        let cid_b = store.put(b"beta block").unwrap();
+        // Log is now 52 + 51 = 103 bytes, under the 120 threshold.
+        // Duplicates from an older writer, then one more put pushes
+        // the log over the threshold and the trigger fires.
+        append_raw_record(&dir, b"alpha block");
+        append_raw_record(&dir, b"beta block");
+        // Log is now 103 + 52 + 51 = 206, over the 120 threshold, but
+        // nothing has triggered yet: only a put runs the check.
+        assert_eq!(store.log_len(), 206);
+        assert_eq!(store.last_auto_compaction(), None);
+        let cid_c = store.put(b"gamma block").unwrap();
+        let done = store
+            .last_auto_compaction()
+            .expect("auto-compact must have run on the over-threshold put");
+        assert_eq!(done.dropped, 2);
+        assert_eq!(done.bytes_saved, 103);
+        // One record per block: 52 + 51 + 52 = 155, bounded by the
+        // number of unique blocks, not by accumulated duplicates.
+        assert_eq!(store.log_len(), 155);
+        assert_eq!(store.auto_compact_error(), None);
+        assert_eq!(store.get(&cid_a).unwrap().unwrap(), b"alpha block");
+        assert_eq!(store.get(&cid_b).unwrap().unwrap(), b"beta block");
+        assert_eq!(store.get(&cid_c).unwrap().unwrap(), b"gamma block");
+        drop(store);
+        let mut reopened = DiskStore::open(&dir).unwrap();
+        assert_eq!(reopened.len(), 3);
+        assert_eq!(reopened.log_len(), 155);
+        assert_eq!(reopened.get(&cid_a).unwrap().unwrap(), b"alpha block");
+        assert_eq!(reopened.get(&cid_b).unwrap().unwrap(), b"beta block");
+        assert_eq!(reopened.get(&cid_c).unwrap().unwrap(), b"gamma block");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_compact_off_by_default_and_when_disarmed() {
+        let dir = test_dir("auto-off");
+        let mut store = DiskStore::open(&dir).unwrap();
+        store.put(b"alpha block").unwrap();
+        store.put(b"beta block").unwrap();
+        append_raw_record(&dir, b"alpha block");
+        append_raw_record(&dir, b"beta block");
+        // No threshold armed: puts never compact, duplicates stay.
+        store.put(b"gamma block").unwrap();
+        assert_eq!(store.log_len(), 103 + 52 + 51 + 52);
+        assert_eq!(store.last_auto_compaction(), None);
+        // Arm it, then disarm it again: the disarm sticks.
+        store.set_auto_compact(Some(10));
+        store.set_auto_compact(None);
+        assert_eq!(store.auto_compact_threshold(), None);
+        store.put(b"delta block").unwrap();
+        assert_eq!(store.last_auto_compaction(), None);
+        assert_eq!(store.log_len(), 103 + 52 + 51 + 52 + 52);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tiny_threshold_compacting_often_never_loses_a_put() {
+        let dir = test_dir("auto-tiny");
+        let mut store = DiskStore::open(&dir).unwrap();
+        // A 1-byte threshold: every put runs the check, and the log
+        // is over threshold from the first record on.
+        store.set_auto_compact(Some(1));
+        let mut cids = Vec::new();
+        for i in 0..20u32 {
+            let data = format!("block number {i:02} payload");
+            let cid = store.put(data.as_bytes()).unwrap();
+            cids.push((cid, data));
+        }
+        // Hand-append duplicates mid-stream, then keep putting: the
+        // trigger must drop them without losing any real block.
+        append_raw_record(&dir, b"block number 00 payload");
+        append_raw_record(&dir, b"block number 05 payload");
+        for i in 20..30u32 {
+            let data = format!("block number {i:02} payload");
+            let cid = store.put(data.as_bytes()).unwrap();
+            cids.push((cid, data));
+        }
+        assert_eq!(store.len(), 30);
+        for (cid, data) in &cids {
+            assert_eq!(store.get(cid).unwrap().unwrap().as_slice(), data.as_bytes());
+        }
+        // The trigger ran (duplicates were dropped at some point).
+        assert!(store.last_auto_compaction().is_some());
+        assert_eq!(store.auto_compact_error(), None);
+        // And everything survives a restart.
+        drop(store);
+        let mut reopened = DiskStore::open(&dir).unwrap();
+        assert_eq!(reopened.len(), 30);
+        for (cid, data) in &cids {
+            assert_eq!(
+                reopened.get(cid).unwrap().unwrap().as_slice(),
+                data.as_bytes()
+            );
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }

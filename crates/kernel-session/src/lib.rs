@@ -27,19 +27,27 @@
 //! API on `Identity`, or a handshake that signs through a callback)
 //! is future work, not a reason to copy the handshake here.
 //!
-//! Known limit, inherited from the carrier handshake: there is no
-//! cookie challenge or proof-of-work before the responder's
-//! Diffie-Hellman, so Hello floods cost the responder one DH and one
-//! signature each. The carrier's own `transport` module adds that
-//! protection; this layer, riding on `kernel-transport`, does not.
-//! The handshake itself is still authenticated: both sides must have
-//! the other's key pinned, and the signatures bind the full
-//! transcript, so a stranger cannot complete a handshake.
+//! Hello floods: this layer rate-limits handshake attempts per peer
+//! IP before any Diffie-Hellman work happens (see [`HandshakeLimiter`]).
+//! `accept` applies a process-wide default limit; servers that expect
+//! floods should use [`accept_with_limiter`] with their own limiter.
+//! This is throttling, not the carrier's cookie challenge or
+//! proof-of-work — the carrier's own `transport` module has the
+//! stronger protection, and this layer, riding on `kernel-transport`,
+//! does not. A distributed flood from many addresses still costs the
+//! responder, and an attacker behind the same NAT as a legitimate peer
+//! shares that peer's budget. The handshake itself is still
+//! authenticated: both sides must have the other's key pinned, and the
+//! signatures bind the full transcript, so a stranger cannot complete
+//! a handshake.
 
 #![forbid(unsafe_code)]
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::net::IpAddr;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
 use kernel_carrier::{CarrierError, Event, Initiator, PinSet, Responder, Session};
@@ -54,6 +62,10 @@ pub enum SessionError {
     /// A transport failure: refused connection, closed peer, frame
     /// too large.
     Transport(TransportError),
+    /// The handshake was refused by the rate limiter before any
+    /// Diffie-Hellman work: too many attempts from this address in
+    /// the current window.
+    RateLimited,
 }
 
 impl fmt::Display for SessionError {
@@ -61,6 +73,9 @@ impl fmt::Display for SessionError {
         match self {
             SessionError::Carrier(e) => write!(f, "carrier: {e}"),
             SessionError::Transport(e) => write!(f, "transport: {e}"),
+            SessionError::RateLimited => {
+                f.write_str("too many handshake attempts from this address")
+            }
         }
     }
 }
@@ -221,10 +236,237 @@ pub fn connect(
     Ok(SecureSession::new(conn, session))
 }
 
+/// Default handshake attempts allowed per peer IP per window for the
+/// process-wide limiter used by [`accept`]. Generous on purpose: it
+/// is a safety net against floods, not a quota on legitimate use.
+pub const DEFAULT_MAX_ATTEMPTS: u32 = 100;
+/// Default window for [`DEFAULT_MAX_ATTEMPTS`].
+pub const DEFAULT_WINDOW: Duration = Duration::from_secs(60);
+/// Default number of peer IPs tracked at once by a limiter.
+pub const DEFAULT_MAX_TRACKED: usize = 1024;
+
+#[derive(Clone, Copy)]
+struct Window {
+    started: Instant,
+    count: u32,
+}
+
+/// Per-IP handshake rate limiting for the responder side.
+///
+/// The limiter is keyed by the peer's IP address, not the full socket
+/// address: the source port is ephemeral and attacker-controlled, so
+/// keying by `SocketAddr` would hand every new connection a fresh
+/// budget and the limit would do nothing against a flood.
+///
+/// Each handshake attempt consumes one slot when it is admitted. A
+/// completed handshake refunds its slot (see
+/// [`HandshakeLimiter::note_success`]): a stranger cannot complete a
+/// handshake — the carrier handshake is authenticated — so floods burn
+/// budget while legitimate peers that finish handshakes do not. A
+/// failed or abandoned attempt keeps its slot until the window resets.
+///
+/// The table is bounded: at most `max_tracked` addresses are kept.
+/// When it is full, expired entries are pruned first, then the oldest
+/// tracked address is evicted to make room. The limiter never grows
+/// unbounded from attacker-controlled addresses.
+pub struct HandshakeLimiter {
+    max_attempts: u32,
+    window: Duration,
+    max_tracked: usize,
+    table: HashMap<IpAddr, Window>,
+    /// Insertion order of tracked addresses, oldest first; used only
+    /// for eviction.
+    order: VecDeque<IpAddr>,
+}
+
+impl HandshakeLimiter {
+    /// A limiter allowing `max_attempts` handshakes per peer IP per
+    /// `window`, tracking at most [`DEFAULT_MAX_TRACKED`] addresses.
+    /// `max_attempts` of 0 refuses every attempt.
+    pub fn new(max_attempts: u32, window: Duration) -> Self {
+        Self::with_capacity(max_attempts, window, DEFAULT_MAX_TRACKED)
+    }
+
+    /// A limiter with an explicit cap on tracked addresses.
+    pub fn with_capacity(max_attempts: u32, window: Duration, max_tracked: usize) -> Self {
+        Self {
+            max_attempts,
+            window,
+            max_tracked,
+            table: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    /// Attempts allowed per peer IP per window.
+    pub fn max_attempts(&self) -> u32 {
+        self.max_attempts
+    }
+
+    /// Length of one counting window.
+    pub fn window(&self) -> Duration {
+        self.window
+    }
+
+    /// Maximum number of peer IPs tracked at once.
+    pub fn max_tracked(&self) -> usize {
+        self.max_tracked
+    }
+
+    /// Number of peer IPs currently tracked.
+    pub fn tracked(&self) -> usize {
+        self.table.len()
+    }
+
+    /// Count one handshake attempt from `ip` at the current time.
+    /// True means the attempt may proceed; false means refuse it
+    /// before doing any handshake work.
+    pub fn admit(&mut self, ip: IpAddr) -> bool {
+        self.admit_at(ip, Instant::now())
+    }
+
+    /// Count one handshake attempt from `ip` at `now`. Exposed so
+    /// tests can move time without sleeping; production callers use
+    /// [`HandshakeLimiter::admit`].
+    pub fn admit_at(&mut self, ip: IpAddr, now: Instant) -> bool {
+        if let Some(w) = self.table.get_mut(&ip) {
+            if now.saturating_duration_since(w.started) >= self.window {
+                w.started = now;
+                w.count = 0;
+            }
+            if w.count >= self.max_attempts {
+                return false;
+            }
+            w.count += 1;
+            return true;
+        }
+        // A new address. Make room first: prune expired entries,
+        // then evict the oldest tracked address.
+        if self.table.len() >= self.max_tracked {
+            let window = self.window;
+            self.table
+                .retain(|_, w| now.saturating_duration_since(w.started) < window);
+            self.order.retain(|k| self.table.contains_key(k));
+            if self.table.len() >= self.max_tracked {
+                match self.order.pop_front() {
+                    Some(oldest) => {
+                        self.table.remove(&oldest);
+                    }
+                    None => return false, // max_tracked == 0
+                }
+            }
+        }
+        self.table.insert(
+            ip,
+            Window {
+                started: now,
+                count: 1,
+            },
+        );
+        self.order.push_back(ip);
+        true
+    }
+
+    /// Refund one attempt for `ip` after a handshake completed.
+    /// A completed handshake costs the responder its DH work once,
+    /// but it is a legitimate peer, not a flood, so it does not keep
+    /// consuming budget. If the refund empties the address's entry
+    /// the entry is dropped. Calling this for an address with no
+    /// entry is a no-op.
+    pub fn note_success(&mut self, ip: IpAddr) {
+        let emptied = match self.table.get_mut(&ip) {
+            Some(w) => {
+                w.count = w.count.saturating_sub(1);
+                w.count == 0
+            }
+            None => false,
+        };
+        if emptied {
+            self.table.remove(&ip);
+            self.order.retain(|k| *k != ip);
+        }
+    }
+}
+
+impl Default for HandshakeLimiter {
+    /// [`DEFAULT_MAX_ATTEMPTS`] per [`DEFAULT_WINDOW`] per IP,
+    /// [`DEFAULT_MAX_TRACKED`] addresses tracked.
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_ATTEMPTS, DEFAULT_WINDOW)
+    }
+}
+
+/// The process-wide default limiter behind [`accept`]. The lock is
+/// held only for the admit/refund check — never across network I/O —
+/// so concurrent handshakes do not serialize on it.
+fn default_limiter() -> &'static Mutex<HandshakeLimiter> {
+    static LIMITER: OnceLock<Mutex<HandshakeLimiter>> = OnceLock::new();
+    LIMITER.get_or_init(|| Mutex::new(HandshakeLimiter::default()))
+}
+
 /// Accept one connection and run the responder side of the carrier
 /// handshake over it: read the Hello, answer with a Response, verify
 /// the Confirm.
+///
+/// The attempt is rate-limited by a process-wide default limiter
+/// ([`DEFAULT_MAX_ATTEMPTS`] attempts per peer IP per
+/// [`DEFAULT_WINDOW`], [`DEFAULT_MAX_TRACKED`] addresses tracked).
+/// A refused attempt returns [`SessionError::RateLimited`] before any
+/// byte is read and before any Diffie-Hellman work. Servers that
+/// expect floods, or that want their own limits, should use
+/// [`accept_with_limiter`] instead.
 pub fn accept(
+    conn: Connection,
+    my_key: &SigningKey,
+    pins: &PinSet,
+) -> Result<SecureSession, SessionError> {
+    let ip = conn.peer_addr()?.ip();
+    {
+        let mut limiter = default_limiter()
+            .lock()
+            .expect("default handshake limiter lock");
+        if !limiter.admit(ip) {
+            return Err(SessionError::RateLimited);
+        }
+    }
+    let result = accept_inner(conn, my_key, pins);
+    if result.is_ok() {
+        let mut limiter = default_limiter()
+            .lock()
+            .expect("default handshake limiter lock");
+        limiter.note_success(ip);
+    }
+    result
+}
+
+/// Accept one connection with an explicit rate limiter. The limiter
+/// is checked before any byte is read from the connection and before
+/// any Diffie-Hellman work: a refused attempt costs the responder
+/// nothing but the dropped socket. A completed handshake refunds its
+/// slot in the limiter; a failed or abandoned one keeps it until the
+/// window resets.
+///
+/// A server handling connections on several threads should hold its
+/// limiter behind a `Mutex` (or use the process-wide default via
+/// [`accept`]); this function takes `&mut` and does not lock.
+pub fn accept_with_limiter(
+    conn: Connection,
+    my_key: &SigningKey,
+    pins: &PinSet,
+    limiter: &mut HandshakeLimiter,
+) -> Result<SecureSession, SessionError> {
+    let ip = conn.peer_addr()?.ip();
+    if !limiter.admit(ip) {
+        return Err(SessionError::RateLimited);
+    }
+    let result = accept_inner(conn, my_key, pins);
+    if result.is_ok() {
+        limiter.note_success(ip);
+    }
+    result
+}
+
+fn accept_inner(
     mut conn: Connection,
     my_key: &SigningKey,
     pins: &PinSet,
@@ -342,7 +584,8 @@ mod tests {
 
         let middle_addr = rx.recv().expect("middle addr");
         let conn = Connection::connect(middle_addr).expect("connect middle");
-        let mut client = connect(conn, &a, public(&b), &pins_with(&[&b])).expect("client handshake");
+        let mut client =
+            connect(conn, &a, public(&b), &pins_with(&[&b])).expect("client handshake");
         client.send(b"secret").expect("send");
         middle.join().expect("middle thread");
 
@@ -371,7 +614,10 @@ mod tests {
         // The client cannot learn why: the server closes the connection
         // after refusing the Hello. Any error here is the refusal.
         assert!(client.is_err());
-        let server_err = server.join().expect("server thread").expect_err("server refused");
+        let server_err = server
+            .join()
+            .expect("server thread")
+            .expect_err("server refused");
         assert!(
             matches!(
                 server_err,
@@ -433,6 +679,291 @@ mod tests {
                 b"three".to_vec(),
                 b"four".to_vec()
             ]
+        );
+    }
+
+    fn ip(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::from([a, b, c, d])
+    }
+
+    #[test]
+    fn limiter_admits_up_to_the_limit_then_refuses() {
+        let mut l = HandshakeLimiter::new(3, Duration::from_secs(60));
+        let now = Instant::now();
+        let addr = ip(10, 0, 0, 1);
+        assert!(l.admit_at(addr, now));
+        assert!(l.admit_at(addr, now));
+        assert!(l.admit_at(addr, now));
+        assert!(!l.admit_at(addr, now));
+    }
+
+    #[test]
+    fn limiter_counts_each_address_separately() {
+        let mut l = HandshakeLimiter::new(1, Duration::from_secs(60));
+        let now = Instant::now();
+        assert!(l.admit_at(ip(10, 0, 0, 1), now));
+        assert!(!l.admit_at(ip(10, 0, 0, 1), now));
+        assert!(l.admit_at(ip(10, 0, 0, 2), now));
+    }
+
+    #[test]
+    fn limiter_window_resets() {
+        let mut l = HandshakeLimiter::new(1, Duration::from_millis(50));
+        let now = Instant::now();
+        let addr = ip(10, 0, 0, 1);
+        assert!(l.admit_at(addr, now));
+        assert!(!l.admit_at(addr, now));
+        assert!(l.admit_at(addr, now + Duration::from_millis(60)));
+    }
+
+    #[test]
+    fn limiter_success_refunds_the_attempt() {
+        let mut l = HandshakeLimiter::new(1, Duration::from_secs(60));
+        let now = Instant::now();
+        let addr = ip(10, 0, 0, 1);
+        assert!(l.admit_at(addr, now));
+        assert!(!l.admit_at(addr, now));
+        l.note_success(addr);
+        assert!(l.admit_at(addr, now));
+        assert_eq!(l.tracked(), 1);
+        // note_success on an unknown address is a no-op.
+        l.note_success(ip(10, 0, 0, 9));
+        assert_eq!(l.tracked(), 1);
+        // A refund that empties the entry drops it from the table.
+        l.note_success(addr);
+        assert_eq!(l.tracked(), 0);
+    }
+
+    #[test]
+    fn limiter_table_is_bounded_and_evicts_the_oldest() {
+        let mut l = HandshakeLimiter::with_capacity(2, Duration::from_secs(60), 2);
+        let now = Instant::now();
+        assert!(l.admit_at(ip(10, 0, 0, 1), now));
+        assert!(l.admit_at(ip(10, 0, 0, 1), now));
+        assert!(l.admit_at(ip(10, 0, 0, 2), now));
+        assert_eq!(l.tracked(), 2);
+        // Table full: admitting a third address evicts the oldest.
+        assert!(l.admit_at(ip(10, 0, 0, 3), now));
+        assert_eq!(l.tracked(), 2);
+        // The evicted address starts a fresh window.
+        assert!(l.admit_at(ip(10, 0, 0, 1), now));
+        assert!(l.admit_at(ip(10, 0, 0, 1), now));
+        assert!(!l.admit_at(ip(10, 0, 0, 1), now));
+    }
+
+    /// Outcome of one responder-side attempt, for tests.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Attempt {
+        Ok,
+        RateLimited,
+        Unpinned,
+        Other(String),
+    }
+
+    fn classify(result: Result<SecureSession, SessionError>) -> Attempt {
+        match result {
+            Ok(_) => Attempt::Ok,
+            Err(SessionError::RateLimited) => Attempt::RateLimited,
+            Err(SessionError::Carrier(CarrierError::UnpinnedPeer)) => Attempt::Unpinned,
+            Err(e) => Attempt::Other(format!("{e:?}")),
+        }
+    }
+
+    /// Spawn a server that accepts `count` connections on `listener`,
+    /// running each through `accept_with_limiter`, and returns the
+    /// outcomes. The limiter is owned by the server thread.
+    fn run_attempts(
+        listener: Listener,
+        server_key: SigningKey,
+        pins: PinSet,
+        limiter: HandshakeLimiter,
+        count: usize,
+    ) -> thread::JoinHandle<Vec<Attempt>> {
+        thread::spawn(move || {
+            let mut limiter = limiter;
+            let mut outcomes = Vec::new();
+            for _ in 0..count {
+                let conn = listener.accept().expect("accept");
+                outcomes.push(classify(accept_with_limiter(
+                    conn,
+                    &server_key,
+                    &pins,
+                    &mut limiter,
+                )));
+            }
+            outcomes
+        })
+    }
+
+    #[test]
+    fn rapid_failed_handshakes_from_one_address_are_refused_before_dh() {
+        let a = key(1); // client key, NOT pinned by the server
+        let b = key(2); // server key
+        let listener = Listener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        // The server pins a key nobody holds, so every attempt fails.
+        let limiter = HandshakeLimiter::new(3, Duration::from_secs(60));
+        let server = run_attempts(listener, b.clone(), pins_with(&[&key(9)]), limiter, 4);
+        for _ in 0..4 {
+            let conn = Connection::connect(addr).expect("connect");
+            // The client's own pin check passes (it pins b), so it
+            // sends a Hello and waits for a Response.
+            assert!(connect(conn, &a, public(&b), &pins_with(&[&b])).is_err());
+        }
+        let outcomes = server.join().expect("server thread");
+        assert_eq!(
+            outcomes,
+            vec![
+                Attempt::Unpinned,
+                Attempt::Unpinned,
+                Attempt::Unpinned,
+                Attempt::RateLimited
+            ]
+        );
+    }
+
+    #[test]
+    fn refused_attempt_sends_no_response_bytes() {
+        let a = key(1);
+        let b = key(2);
+        let listener = Listener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let limiter = HandshakeLimiter::new(3, Duration::from_secs(60));
+        let server = run_attempts(listener, b.clone(), pins_with(&[&key(9)]), limiter, 4);
+        // Exhaust the budget with three failed attempts.
+        for _ in 0..3 {
+            let conn = Connection::connect(addr).expect("connect");
+            assert!(connect(conn, &a, public(&b), &pins_with(&[&b])).is_err());
+        }
+        // The fourth attempt: send a valid Hello by hand. If the
+        // responder had read it and done DH work, it would answer
+        // with a Response; a refusal must close the connection
+        // without sending anything. Timing varies: the responder
+        // may already have closed by the time we write (BrokenPipe
+        // on send), or the close may land during the read
+        // (ConnectionClosed or ConnectionReset). Every one of those
+        // proves no Response was sent; only actual bytes would
+        // disprove it.
+        let mut raw = Connection::connect(addr).expect("connect");
+        let (_initiator, hello) =
+            Initiator::start(&a, public(&b), &pins_with(&[&b])).expect("hello");
+        match raw.send(&hello) {
+            Ok(()) => {
+                raw.set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("timeout");
+                match raw.recv() {
+                    Err(TransportError::ConnectionClosed) => {}
+                    Err(TransportError::Io(e))
+                        if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+                    other => panic!(
+                        "expected the refused responder to close without sending a Response, got {other:?}"
+                    ),
+                }
+            }
+            Err(TransportError::Io(e)) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => panic!("unexpected error sending Hello to a refused responder: {e:?}"),
+        }
+        let outcomes = server.join().expect("server thread");
+        assert_eq!(
+            outcomes,
+            vec![
+                Attempt::Unpinned,
+                Attempt::Unpinned,
+                Attempt::Unpinned,
+                Attempt::RateLimited
+            ]
+        );
+    }
+
+    #[test]
+    fn legitimate_handshakes_from_different_addresses_still_succeed() {
+        let a = key(1); // flood client, unpinned by the server
+        let c = key(3); // legitimate client, pinned by the server
+        let b = key(2); // server key
+                        // Bound dual-stack so clients can reach it via 127.0.0.1
+                        // (seen as ::ffff:127.0.0.1) and via ::1. Note 127.0.0.2 does
+                        // NOT work as a second address here: this VM's loopback
+                        // reports it to the server as 127.0.0.1, so it would share
+                        // the flooded budget.
+        let listener = Listener::bind("[::]:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let limiter = HandshakeLimiter::new(2, Duration::from_secs(60));
+        let server = run_attempts(listener, b.clone(), pins_with(&[&c]), limiter, 3);
+        // Flood from 127.0.0.1: two failed attempts exhaust its budget.
+        for _ in 0..2 {
+            let conn = Connection::connect(("127.0.0.1", port)).expect("connect");
+            assert!(connect(conn, &a, public(&b), &pins_with(&[&b])).is_err());
+        }
+        // A peer from ::1 has its own budget and completes.
+        let conn = Connection::connect(("::1", port)).expect("connect ::1");
+        let session = connect(conn, &c, public(&b), &pins_with(&[&b])).expect("legit handshake");
+        assert_eq!(session.peer(), public(&b));
+        let outcomes = server.join().expect("server thread");
+        assert_eq!(
+            outcomes,
+            vec![Attempt::Unpinned, Attempt::Unpinned, Attempt::Ok]
+        );
+    }
+
+    #[test]
+    fn a_single_failed_handshake_does_not_lock_out_a_later_legitimate_one() {
+        let a = key(1); // unpinned
+        let c = key(3); // pinned
+        let b = key(2);
+        let listener = Listener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let limiter = HandshakeLimiter::new(3, Duration::from_secs(60));
+        let server = run_attempts(listener, b.clone(), pins_with(&[&c]), limiter, 2);
+        let conn = Connection::connect(addr).expect("connect");
+        assert!(connect(conn, &a, public(&b), &pins_with(&[&b])).is_err());
+        let conn = Connection::connect(addr).expect("connect");
+        let session = connect(conn, &c, public(&b), &pins_with(&[&b])).expect("legit handshake");
+        assert_eq!(session.peer(), public(&b));
+        let outcomes = server.join().expect("server thread");
+        assert_eq!(outcomes, vec![Attempt::Unpinned, Attempt::Ok]);
+    }
+
+    #[test]
+    fn successful_handshakes_do_not_consume_budget() {
+        let c = key(3);
+        let b = key(2);
+        let listener = Listener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        // Only 2 attempts per window — but three successes in a row
+        // must all pass, because each completed handshake refunds
+        // its slot.
+        let limiter = HandshakeLimiter::new(2, Duration::from_secs(60));
+        let server = run_attempts(listener, b.clone(), pins_with(&[&c]), limiter, 3);
+        for _ in 0..3 {
+            let conn = Connection::connect(addr).expect("connect");
+            let session = connect(conn, &c, public(&b), &pins_with(&[&b])).expect("handshake");
+            assert_eq!(session.peer(), public(&b));
+        }
+        let outcomes = server.join().expect("server thread");
+        assert_eq!(outcomes, vec![Attempt::Ok, Attempt::Ok, Attempt::Ok]);
+    }
+
+    #[test]
+    fn limiter_resets_after_the_window() {
+        let a = key(1); // unpinned
+        let b = key(2);
+        let listener = Listener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let limiter = HandshakeLimiter::new(1, Duration::from_millis(100));
+        let server = run_attempts(listener, b.clone(), pins_with(&[&key(9)]), limiter, 3);
+        let conn = Connection::connect(addr).expect("connect");
+        assert!(connect(conn, &a, public(&b), &pins_with(&[&b])).is_err());
+        let conn = Connection::connect(addr).expect("connect");
+        assert!(connect(conn, &a, public(&b), &pins_with(&[&b])).is_err());
+        thread::sleep(Duration::from_millis(150));
+        let conn = Connection::connect(addr).expect("connect");
+        assert!(connect(conn, &a, public(&b), &pins_with(&[&b])).is_err());
+        let outcomes = server.join().expect("server thread");
+        // Third attempt is admitted again after the window (and fails
+        // on the pin check, not on the limiter).
+        assert_eq!(
+            outcomes,
+            vec![Attempt::Unpinned, Attempt::RateLimited, Attempt::Unpinned]
         );
     }
 }
