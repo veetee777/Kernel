@@ -9,3 +9,4 @@ description = "Planet•K: signed social posts, comments, likes, reposts, media 
 kernel-crypto = { path = "../kernel-crypto" }
 kernel-identity = { path = "../kernel-identity" }
 kernel-storage = { path = "../kernel-storage" }
+kernel-sim = { path = "../kernel-sim" }

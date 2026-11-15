@@ -340,6 +340,54 @@ impl Library {
     pub fn note_count(&self) -> usize {
         self.notes.values().map(|v| v.len()).sum()
     }
+
+    /// Restore one verse from durable storage (used by
+    /// [`crate::persistence`] replay). This is the ingest path
+    /// without the text-format parsing: the reference is validated,
+    /// the text is stored as one block, the book is registered, and
+    /// the concordance is updated. A verse already present with the
+    /// same text is a no-op (replay is idempotent, so a record
+    /// written twice by a retried save is harmless); the same verse
+    /// with different text is an error.
+    pub(crate) fn restore_verse(
+        &mut self,
+        book: &str,
+        chapter: u32,
+        verse: u32,
+        text: &str,
+    ) -> Result<(), ScriptureError> {
+        let reference = Reference::verse(book, chapter, verse)?;
+        let key = VerseKey::from_reference(&reference).unwrap();
+        if text.is_empty() {
+            return Err(ScriptureError::Persistence(
+                "verse text in log is empty".to_string(),
+            ));
+        }
+        if let Some(&existing_cid) = self.index.get(&key) {
+            let existing = self.store.get(&existing_cid)?;
+            if existing == text.as_bytes() {
+                return Ok(());
+            }
+            return Err(ScriptureError::Persistence(format!(
+                "verse {reference} in log conflicts with stored text"
+            )));
+        }
+        let cid = self.store.put(text.as_bytes());
+        self.index.insert(key.clone(), cid);
+        self.register_book(&reference.book);
+        self.concordance.add(&key, text);
+        Ok(())
+    }
+
+    /// The notes attached to a verse, exactly as stored (no
+    /// re-verification filtering). Used by [`crate::persistence`]
+    /// to find which notes are already durable.
+    pub(crate) fn notes_for_key(&self, key: &VerseKey) -> &[StudyNote] {
+        match self.notes.get(key) {
+            Some(notes) => notes.as_slice(),
+            None => &[],
+        }
+    }
 }
 
 #[cfg(test)]

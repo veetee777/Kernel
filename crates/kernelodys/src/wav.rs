@@ -121,7 +121,9 @@ pub struct PlayedWav {
 }
 
 fn u16le(bytes: &[u8], off: usize) -> Option<u16> {
-    bytes.get(off..off + 2).map(|s| u16::from_le_bytes([s[0], s[1]]))
+    bytes
+        .get(off..off + 2)
+        .map(|s| u16::from_le_bytes([s[0], s[1]]))
 }
 
 fn u32le(bytes: &[u8], off: usize) -> Option<u32> {
@@ -144,9 +146,7 @@ pub fn decode_wav(bytes: &[u8]) -> Result<WavAudio, WavError> {
         )));
     }
     if &bytes[0..4] != b"RIFF" {
-        return Err(WavError::NotWav(
-            "missing RIFF magic".to_string(),
-        ));
+        return Err(WavError::NotWav("missing RIFF magic".to_string()));
     }
     // A declared RIFF size that runs past the buffer means the file
     // was cut short. A size of zero means "unknown"; accept it.
@@ -198,52 +198,45 @@ pub fn decode_wav(bytes: &[u8]) -> Result<WavAudio, WavError> {
         }
     }
 
-    let (fmt_off, fmt_len) = fmt.ok_or_else(|| {
-        WavError::Truncated("missing fmt chunk".to_string())
-    })?;
-    let (data_off, data_len) = data.ok_or_else(|| {
-        WavError::Truncated("missing data chunk".to_string())
-    })?;
+    let (fmt_off, fmt_len) =
+        fmt.ok_or_else(|| WavError::Truncated("missing fmt chunk".to_string()))?;
+    let (data_off, data_len) =
+        data.ok_or_else(|| WavError::Truncated("missing data chunk".to_string()))?;
     if fmt_len < 16 {
         return Err(WavError::Truncated(format!(
             "fmt chunk is {fmt_len} bytes, needs at least 16"
         )));
     }
-    let format_tag = u16le(bytes, fmt_off).ok_or_else(|| {
-        WavError::Truncated("fmt chunk too short for format tag".to_string())
-    })?;
+    let format_tag = u16le(bytes, fmt_off)
+        .ok_or_else(|| WavError::Truncated("fmt chunk too short for format tag".to_string()))?;
     if format_tag != 1 {
         return Err(WavError::UnsupportedFormat(format!(
             "only PCM (format tag 1) is supported, got tag {format_tag}"
         )));
     }
-    let channels = u16le(bytes, fmt_off + 2).ok_or_else(|| {
-        WavError::Truncated("fmt chunk too short for channel count".to_string())
-    })?;
+    let channels = u16le(bytes, fmt_off + 2)
+        .ok_or_else(|| WavError::Truncated("fmt chunk too short for channel count".to_string()))?;
     if channels != 1 && channels != 2 {
         return Err(WavError::UnsupportedFormat(format!(
             "only mono and stereo are supported, got {channels} channels"
         )));
     }
-    let sample_rate = u32le(bytes, fmt_off + 4).ok_or_else(|| {
-        WavError::Truncated("fmt chunk too short for sample rate".to_string())
-    })?;
+    let sample_rate = u32le(bytes, fmt_off + 4)
+        .ok_or_else(|| WavError::Truncated("fmt chunk too short for sample rate".to_string()))?;
     if sample_rate == 0 {
         return Err(WavError::UnsupportedFormat(
             "sample rate must not be zero".to_string(),
         ));
     }
-    let bits = u16le(bytes, fmt_off + 14).ok_or_else(|| {
-        WavError::Truncated("fmt chunk too short for bit depth".to_string())
-    })?;
+    let bits = u16le(bytes, fmt_off + 14)
+        .ok_or_else(|| WavError::Truncated("fmt chunk too short for bit depth".to_string()))?;
     if bits != 16 {
         return Err(WavError::UnsupportedFormat(format!(
             "only 16-bit samples are supported, got {bits}-bit"
         )));
     }
-    let block_align = u16le(bytes, fmt_off + 12).ok_or_else(|| {
-        WavError::Truncated("fmt chunk too short for block align".to_string())
-    })?;
+    let block_align = u16le(bytes, fmt_off + 12)
+        .ok_or_else(|| WavError::Truncated("fmt chunk too short for block align".to_string()))?;
     if block_align as usize != channels as usize * 2 {
         return Err(WavError::UnsupportedFormat(format!(
             "block align {block_align} does not match {channels} channels of 16-bit samples"
@@ -343,8 +336,8 @@ mod tests {
         (0..n)
             .map(|i| {
                 (20000.0
-                    * (2.0 * std::f64::consts::PI * freq_hz * i as f64 / sample_rate as f64)
-                        .sin()) as i16
+                    * (2.0 * std::f64::consts::PI * freq_hz * i as f64 / sample_rate as f64).sin())
+                    as i16
             })
             .collect()
     }
@@ -398,10 +391,7 @@ mod tests {
     #[test]
     fn truncated_header_refused() {
         assert!(matches!(decode_wav(&[]), Err(WavError::Truncated(_))));
-        assert!(matches!(
-            decode_wav(b"RIFF"),
-            Err(WavError::Truncated(_))
-        ));
+        assert!(matches!(decode_wav(b"RIFF"), Err(WavError::Truncated(_))));
         assert!(matches!(
             decode_wav(b"RIFF\x24\x00\x00\x00WAV"),
             Err(WavError::Truncated(_))
@@ -411,19 +401,13 @@ mod tests {
         bare.extend_from_slice(b"RIFF");
         bare.extend_from_slice(&4u32.to_le_bytes());
         bare.extend_from_slice(b"WAVE");
-        assert!(matches!(
-            decode_wav(&bare),
-            Err(WavError::Truncated(_))
-        ));
+        assert!(matches!(decode_wav(&bare), Err(WavError::Truncated(_))));
         // RIFF size declares far more than the buffer holds.
         let mut lying = Vec::new();
         lying.extend_from_slice(b"RIFF");
         lying.extend_from_slice(&10_000u32.to_le_bytes());
         lying.extend_from_slice(b"WAVE");
-        assert!(matches!(
-            decode_wav(&lying),
-            Err(WavError::Truncated(_))
-        ));
+        assert!(matches!(decode_wav(&lying), Err(WavError::Truncated(_))));
     }
 
     #[test]
@@ -435,10 +419,7 @@ mod tests {
         bytes.truncate(bytes.len() - 4);
         let riff_len = (bytes.len() - 8) as u32;
         bytes[4..8].copy_from_slice(&riff_len.to_le_bytes());
-        assert!(matches!(
-            decode_wav(&bytes),
-            Err(WavError::Truncated(_))
-        ));
+        assert!(matches!(decode_wav(&bytes), Err(WavError::Truncated(_))));
     }
 
     #[test]
@@ -510,8 +491,7 @@ mod tests {
         let bytes = build_wav(1, 2, sample_rate, 16, &interleaved, None);
         let played = play_wav_432(&bytes).unwrap();
         assert_eq!(played.retuned.channels, 2);
-        let expected_frames =
-            (played.decoded.frames() as f64 * 440.0 / 432.0).ceil() as usize;
+        let expected_frames = (played.decoded.frames() as f64 * 440.0 / 432.0).ceil() as usize;
         assert_eq!(played.retuned.frames(), expected_frames);
         let got_l = measured_freq(&played.retuned.channel(0), sample_rate);
         let got_r = measured_freq(&played.retuned.channel(1), sample_rate);

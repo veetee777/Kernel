@@ -40,6 +40,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use crate::normalize;
 use crate::tuning;
 use crate::wav::{decode_wav, WavAudio, WavError};
 
@@ -347,6 +348,9 @@ pub struct PlaybackEngine {
     /// When `true`, [`PlaybackEngine::play`] paces itself to real
     /// time (sleeps between chunks). Off for offline rendering.
     realtime: bool,
+    /// Normalization gain applied to every chunk as it is written
+    /// (see [`PlaybackEngine::set_gain`]). `1.0` means no change.
+    gain: f32,
     /// Wall-clock origin of the sample clock; set on the first chunk.
     origin: Option<Instant>,
     /// When the current pause started, for shifting the origin on resume.
@@ -398,6 +402,7 @@ impl PlaybackEngine {
             chunks_written: 0,
             state: PlaybackState::Ready,
             realtime: true,
+            gain: 1.0,
             origin: None,
             paused_at: None,
         })
@@ -485,6 +490,29 @@ impl PlaybackEngine {
         self.realtime = realtime;
     }
 
+    /// Normalization gain applied to the retuned samples as they are
+    /// written to the sink. Use [`crate::normalize::normalize_gain`]
+    /// to compute it from a track's peak so tracks play at the same
+    /// level. The gain is clamped to [`crate::normalize::MAX_GAIN`]
+    /// and every scaled sample is clamped to the `i16` range, so the
+    /// output can never clip past full scale. A non-finite or
+    /// negative gain is refused. May be set at any time; it applies
+    /// to chunks written after the call.
+    pub fn set_gain(&mut self, gain: f32) -> Result<(), PlaybackError> {
+        if !gain.is_finite() || gain < 0.0 {
+            return Err(PlaybackError::InvalidState(format!(
+                "gain must be finite and non-negative, got {gain}"
+            )));
+        }
+        self.gain = gain.min(normalize::MAX_GAIN);
+        Ok(())
+    }
+
+    /// The normalization gain currently applied to output chunks.
+    pub fn gain(&self) -> f32 {
+        self.gain
+    }
+
     /// Stream one chunk (up to `chunk_frames` frames) to `sink`.
     /// Returns the frames written: 0 when paused, stopped, finished,
     /// or when the audio is empty. Never drops or duplicates a sample.
@@ -527,7 +555,13 @@ impl PlaybackEngine {
         let n = self.channels() as usize;
         let start = self.position_frames * n;
         let end = (self.position_frames + frames) * n;
-        sink.write(&self.retuned.samples[start..end])?;
+        let chunk = &self.retuned.samples[start..end];
+        if self.gain == 1.0 {
+            sink.write(chunk)?;
+        } else {
+            let scaled = normalize::apply_gain(chunk, self.gain);
+            sink.write(&scaled)?;
+        }
         self.position_frames += frames;
         self.chunks_written += 1;
         if self.position_frames >= total {
@@ -621,6 +655,23 @@ impl PlaybackEngine {
     }
 }
 
+/// Stream an engine to a `.wav` file on disk, offline (no real-time
+/// pacing). Flush runs even if playback failed, so the file still
+/// holds a valid WAV of whatever was written. A playback error wins
+/// over a flush error.
+fn render_engine_to_file(
+    engine: &mut PlaybackEngine,
+    path: &Path,
+) -> Result<PlaybackReport, PlaybackError> {
+    let mut sink = WavFileSink::create(path, engine.sample_rate(), engine.channels())?;
+    let result = engine.play(&mut sink);
+    let flush_result = sink.flush();
+    match result {
+        Ok(report) => flush_result.map(|()| report),
+        Err(e) => Err(e),
+    }
+}
+
 /// Decode a WAV, retune it to 432 Hz, and render it to a `.wav` file
 /// on disk through the playback engine. Returns a report of what was
 /// written. Rendering to a file is offline: the engine does not pace
@@ -629,16 +680,40 @@ impl PlaybackEngine {
 pub fn play_wav_to_file(bytes: &[u8], path: &Path) -> Result<PlaybackReport, PlaybackError> {
     let mut engine = PlaybackEngine::from_wav(bytes)?;
     engine.set_realtime(false);
-    let mut sink = WavFileSink::create(path, engine.sample_rate(), engine.channels())?;
-    let result = engine.play(&mut sink);
-    let flush_result = sink.flush();
-    // Flush runs even if playback failed, so the file still holds a
-    // valid WAV of whatever was written. A playback error wins over a
-    // flush error.
-    match result {
-        Ok(report) => flush_result.map(|()| report),
-        Err(e) => Err(e),
-    }
+    render_engine_to_file(&mut engine, path)
+}
+
+/// Like [`play_wav_to_file`], but the engine applies `gain` to the
+/// retuned samples as they are written. The gain is clamped to
+/// [`crate::normalize::MAX_GAIN`] and samples are clamped to the
+/// `i16` range, so the output cannot clip.
+pub fn play_wav_to_file_with_gain(
+    bytes: &[u8],
+    path: &Path,
+    gain: f32,
+) -> Result<PlaybackReport, PlaybackError> {
+    let mut engine = PlaybackEngine::from_wav(bytes)?;
+    engine.set_realtime(false);
+    engine.set_gain(gain)?;
+    render_engine_to_file(&mut engine, path)
+}
+
+/// Like [`play_wav_to_file`], but the gain is computed from the
+/// track's own peak ([`crate::normalize::normalize_gain`]), so the
+/// rendered file plays at full-scale peak. The gain is computed on
+/// the decoded samples; the retune cannot raise a peak (linear
+/// interpolation stays between neighbouring samples), so the output
+/// peak never exceeds full scale.
+pub fn play_wav_to_file_normalized(
+    bytes: &[u8],
+    path: &Path,
+) -> Result<PlaybackReport, PlaybackError> {
+    let decoded = decode_wav(bytes)?;
+    let gain = normalize::normalize_gain(&decoded.samples);
+    let mut engine = PlaybackEngine::from_decoded(decoded)?;
+    engine.set_realtime(false);
+    engine.set_gain(gain)?;
+    render_engine_to_file(&mut engine, path)
 }
 
 // ---------------------------------------------------------------------------
@@ -1127,5 +1202,60 @@ mod tests {
             play_wav_to_file(b"", &path),
             Err(PlaybackError::Wav(_))
         ));
+    }
+
+    #[test]
+    fn engine_applies_gain_during_playback() {
+        let sample_rate = 44_100u32;
+        let samples = pattern_samples(1050);
+        let bytes = build_wav(1, sample_rate, &samples);
+        let direct = crate::wav::play_wav_432(&bytes).unwrap().retuned.samples;
+        let mut engine =
+            PlaybackEngine::with_chunk_frames(decode_wav(&bytes).unwrap(), 100).unwrap();
+        assert_eq!(engine.gain(), 1.0);
+        engine.set_gain(2.0).unwrap();
+        assert_eq!(engine.gain(), 2.0);
+        let mut sink = VecSink::new(sample_rate, 1);
+        engine.set_realtime(false);
+        let report = engine.play(&mut sink).unwrap();
+        assert!(report.finished);
+        // The output is the direct retune, scaled by the gain, with
+        // every sample clamped to the i16 range.
+        let expected = crate::normalize::apply_gain(&direct, 2.0);
+        assert_eq!(sink.samples, expected);
+        // Gain above the cap is clamped, not refused.
+        let mut engine = PlaybackEngine::from_decoded(decode_wav(&bytes).unwrap()).unwrap();
+        engine.set_gain(100.0).unwrap();
+        assert_eq!(engine.gain(), crate::normalize::MAX_GAIN);
+        // Non-finite and negative gains are refused.
+        assert!(engine.set_gain(f32::NAN).is_err());
+        assert!(engine.set_gain(-1.0).is_err());
+        assert!(engine.set_gain(f32::INFINITY).is_err());
+    }
+
+    #[test]
+    fn normalized_render_brings_quiet_track_to_full_scale() {
+        let sample_rate = 8000u32;
+        // A quiet 440 Hz sine at amplitude 5000.
+        let samples: Vec<i16> = (0..8000)
+            .map(|i| {
+                (5000.0
+                    * (2.0 * std::f64::consts::PI * 440.0 * i as f64 / sample_rate as f64).sin())
+                    as i16
+            })
+            .collect();
+        let bytes = build_wav(1, sample_rate, &samples);
+        let path = test_path("normalized");
+        let report = play_wav_to_file_normalized(&bytes, &path).unwrap();
+        assert!(report.finished);
+        let out = std::fs::read(&path).unwrap();
+        let audio = decode_wav(&out).unwrap();
+        let peak = crate::normalize::peak_amplitude(&audio.samples);
+        // Full scale, within interpolation rounding of it.
+        assert!(
+            peak >= 32_700,
+            "normalized render peaked at {peak}, expected near 32767"
+        );
+        assert!(peak <= 32767);
     }
 }

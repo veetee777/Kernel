@@ -38,6 +38,13 @@ use kernel_storage::{Cid, ContentStore};
 /// Domain separator for provenance signatures.
 const PROVENANCE_DOMAIN: &[u8] = b"KART-PROV1";
 
+/// Durable binary persistence for the catalog: an append-only log
+/// that rebuilds the catalog exactly. See [`persistence`] for the
+/// format and corruption rules.
+pub mod persistence;
+
+pub use persistence::ArtifactStore;
+
 /// Errors returned by the artifacts pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArtifactError {
@@ -65,6 +72,8 @@ pub enum ArtifactError {
     BadProvenance(String),
     /// Linking this variant would close a cycle in the variant tree.
     Cycle { parent: String, child: String },
+    /// A persistence operation failed (I/O or a corrupt log file).
+    Persistence(String),
 }
 
 impl fmt::Display for ArtifactError {
@@ -93,11 +102,18 @@ impl fmt::Display for ArtifactError {
                 f,
                 "linking {child} as a variant of {parent} would close a cycle"
             ),
+            ArtifactError::Persistence(msg) => write!(f, "persistence error: {msg}"),
         }
     }
 }
 
 impl std::error::Error for ArtifactError {}
+
+impl From<std::io::Error> for ArtifactError {
+    fn from(e: std::io::Error) -> Self {
+        ArtifactError::Persistence(e.to_string())
+    }
+}
 
 /// What kind of record this is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -191,6 +207,112 @@ impl ProvenanceEvent {
             signature: holder.sign(&message),
         }
     }
+
+    /// Encode the event to bytes. `decode(encode(event)) == event`.
+    ///
+    /// Binary encoding (explicit, no JSON): `KPEVT1` + holder public
+    /// key (32) + name length (u32 LE) + name bytes + timestamp (u64
+    /// LE) + location length (u32 LE) + location bytes + note length
+    /// (u32 LE) + note bytes + signature (64). Decoding is strict:
+    /// bad magic, truncation, or trailing bytes are all errors. The
+    /// signature itself is NOT verified by `decode` — that happens
+    /// against the record id when the event is used (the signature
+    /// covers the record id, which is not in these bytes).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(EVENT_MAGIC);
+        out.extend_from_slice(self.holder.public_key().as_bytes());
+        push_len_bytes(&mut out, self.holder.display_name().as_bytes());
+        out.extend_from_slice(&self.timestamp.to_le_bytes());
+        push_len_bytes(&mut out, self.location.as_bytes());
+        push_len_bytes(&mut out, self.note.as_bytes());
+        out.extend_from_slice(&self.signature.to_bytes());
+        out
+    }
+
+    /// Decode bytes produced by [`ProvenanceEvent::encode`]. Strict:
+    /// bad magic, truncation, trailing bytes, an invalid public key,
+    /// or an invalid display name are all errors.
+    pub fn decode<'a>(bytes: &'a [u8]) -> Result<Self, ArtifactError> {
+        let mut off = 0usize;
+        let take = |bytes: &'a [u8], off: &mut usize, n: usize| -> Result<&'a [u8], ArtifactError> {
+            if bytes.len() - *off < n {
+                return Err(ArtifactError::BadProvenance(
+                    "event is truncated".to_string(),
+                ));
+            }
+            let slice = &bytes[*off..*off + n];
+            *off += n;
+            Ok(slice)
+        };
+        let magic = take(bytes, &mut off, 6)?;
+        if magic != EVENT_MAGIC {
+            return Err(ArtifactError::BadProvenance(
+                "bad KPEVT1 magic".to_string(),
+            ));
+        }
+        let key_bytes: [u8; 32] = take(bytes, &mut off, 32)?.try_into().unwrap();
+        let public_key = Ed25519PublicKey::from_bytes(&key_bytes).map_err(|e| {
+            ArtifactError::BadProvenance(format!("invalid holder public key: {e}"))
+        })?;
+        let name = read_len_bytes(bytes, &mut off)?;
+        let name = String::from_utf8(name.to_vec()).map_err(|_| {
+            ArtifactError::BadProvenance("holder name is not UTF-8".to_string())
+        })?;
+        let timestamp = u64::from_le_bytes(take(bytes, &mut off, 8)?.try_into().unwrap());
+        let location = read_len_bytes(bytes, &mut off)?;
+        let location = String::from_utf8(location.to_vec()).map_err(|_| {
+            ArtifactError::BadProvenance("location is not UTF-8".to_string())
+        })?;
+        let note = read_len_bytes(bytes, &mut off)?;
+        let note = String::from_utf8(note.to_vec())
+            .map_err(|_| ArtifactError::BadProvenance("note is not UTF-8".to_string()))?;
+        let sig_bytes: [u8; 64] = take(bytes, &mut off, 64)?.try_into().unwrap();
+        if off != bytes.len() {
+            return Err(ArtifactError::BadProvenance(
+                "trailing bytes after event".to_string(),
+            ));
+        }
+        let holder = PeerId::new(public_key, &name).map_err(|e| {
+            ArtifactError::BadProvenance(format!("invalid holder identity: {e}"))
+        })?;
+        Ok(Self {
+            holder,
+            timestamp,
+            location,
+            note,
+            signature: Ed25519Signature::from_bytes(&sig_bytes),
+        })
+    }
+}
+
+/// Domain separator for provenance event encodings.
+const EVENT_MAGIC: &[u8; 6] = b"KPEVT1";
+
+/// Append a u32-LE length prefix plus the bytes.
+fn push_len_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(bytes);
+}
+
+/// Read a u32-LE length-prefixed byte string. The length must fit in
+/// the remaining input.
+fn read_len_bytes<'a>(bytes: &'a [u8], off: &mut usize) -> Result<&'a [u8], ArtifactError> {
+    if bytes.len() - *off < 4 {
+        return Err(ArtifactError::BadProvenance(
+            "event is truncated".to_string(),
+        ));
+    }
+    let len = u32::from_le_bytes(bytes[*off..*off + 4].try_into().unwrap()) as usize;
+    *off += 4;
+    if bytes.len() - *off < len {
+        return Err(ArtifactError::BadProvenance(
+            "event is truncated".to_string(),
+        ));
+    }
+    let slice = &bytes[*off..*off + len];
+    *off += len;
+    Ok(slice)
 }
 
 /// The exact bytes a provenance signature covers.
@@ -580,6 +702,138 @@ impl Catalog {
             .collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
         out
+    }
+
+    /// All record ids, sorted. Used by [`crate::persistence`] to
+    /// write records in a deterministic order.
+    pub(crate) fn record_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.records.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    /// A record by id, exactly as stored — no provenance
+    /// verification, unlike [`Catalog::get`]. Used by
+    /// [`crate::persistence`] to read the state that must be saved.
+    pub(crate) fn record_raw(&self, id: &str) -> Option<&Record> {
+        self.records.get(id)
+    }
+
+    /// Restore one record from durable storage (used by
+    /// [`crate::persistence`] replay). The record is created at the
+    /// `Intake` stage with no parent; later log records advance its
+    /// stage and link its variants.
+    ///
+    /// The content and the provenance chain are re-verified here:
+    /// the stored bytes must hash to the record's CID and every
+    /// provenance signature must check out in order. A record that
+    /// fails either check is restored at the terminal `Failed`
+    /// stage with the failure recorded — the same outcome as
+    /// calling [`Catalog::verify`] on it. That is how a record that
+    /// failed verification before a restart keeps its `Failed`
+    /// stage: it fails verification again on load, instead of being
+    /// silently resurrected as `Intake` or dropped from the log.
+    ///
+    /// A record with this id already in the catalog is a no-op when
+    /// its intake fields match (replay is idempotent, so a record
+    /// written twice by a retried save is harmless); a conflicting
+    /// duplicate is an error.
+    pub(crate) fn restore_record(
+        &mut self,
+        record: Record,
+        content: &[u8],
+    ) -> Result<(), ArtifactError> {
+        if let Some(existing) = self.records.get(&record.id) {
+            let same = existing.kind == record.kind
+                && existing.title == record.title
+                && existing.description == record.description
+                && existing.content_cid == record.content_cid
+                && existing.provenance.len() == record.provenance.len()
+                && existing
+                    .provenance
+                    .iter()
+                    .zip(record.provenance.iter())
+                    .all(|(a, b)| a.encode() == b.encode());
+            if same {
+                return Ok(());
+            }
+            return Err(ArtifactError::Persistence(format!(
+                "record {} in log conflicts with stored record",
+                record.id
+            )));
+        }
+        let mut record = record;
+        let actual = Cid::from_bytes(sha256(content));
+        if actual != record.content_cid {
+            // Content no longer hashes to the claimed CID: the
+            // record is broken, not the log. Keep the bytes under
+            // the claimed CID (as they were) and fail the record.
+            self.store.put_unchecked(&record.content_cid, content.to_vec());
+            record.stage = Stage::Failed;
+            record.verification_error = Some(
+                ArtifactError::ContentMismatch {
+                    cid: record.content_cid,
+                    actual,
+                }
+                .to_string(),
+            );
+            self.records.insert(record.id.clone(), record);
+            return Ok(());
+        }
+        self.store.put(content);
+        if let Err(e) = verify_chain(&record.id, &record.provenance) {
+            record.stage = Stage::Failed;
+            record.verification_error = Some(e.to_string());
+            self.records.insert(record.id.clone(), record);
+            return Ok(());
+        }
+        record.stage = Stage::Intake;
+        record.verification_error = None;
+        self.records.insert(record.id.clone(), record);
+        Ok(())
+    }
+
+    /// Advance a record's stage during replay (used by
+    /// [`crate::persistence`]). Only the transitions the public
+    /// pipeline allows are accepted — `Intake -> Verified`,
+    /// `Intake -> Failed`, `Verified -> Catalogued`,
+    /// `Catalogued -> Published` — plus two replay-only rules that
+    /// keep a retried save from corrupting the log: a stage event
+    /// whose target the record has already reached is a no-op, and
+    /// stage events for a record already in the terminal `Failed`
+    /// stage are ignored. Anything else is a corrupt record.
+    pub(crate) fn restore_stage(
+        &mut self,
+        id: &str,
+        stage: Stage,
+        error: Option<String>,
+    ) -> Result<(), ArtifactError> {
+        let record = self
+            .records
+            .get_mut(id)
+            .ok_or_else(|| ArtifactError::NotFound(id.to_string()))?;
+        if record.stage == Stage::Failed {
+            return Ok(());
+        }
+        if stage == record.stage {
+            return Ok(());
+        }
+        let allowed = matches!(
+            (record.stage, stage),
+            (Stage::Intake, Stage::Verified)
+                | (Stage::Intake, Stage::Failed)
+                | (Stage::Verified, Stage::Catalogued)
+                | (Stage::Catalogued, Stage::Published)
+        );
+        if !allowed {
+            return Err(ArtifactError::Persistence(format!(
+                "illegal stage transition {} -> {} for record {id}",
+                record.stage, stage
+            )));
+        }
+        record.stage = stage;
+        record.verification_error = error;
+        Ok(())
     }
 }
 

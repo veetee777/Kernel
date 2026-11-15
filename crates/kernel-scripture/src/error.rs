@@ -22,6 +22,10 @@ pub enum ScriptureError {
     BadSignature,
     /// A study note's encoded bytes were malformed.
     BadNote(String),
+    /// A persistence operation failed (I/O or a corrupt log file).
+    /// The message names the problem; no raw I/O error is kept, so
+    /// this stays `Clone` and `PartialEq` like the other variants.
+    Persistence(String),
     /// Wraps a [`StorageError`].
     Storage(StorageError),
     /// Wraps an [`IdentityError`].
@@ -46,6 +50,7 @@ impl fmt::Display for ScriptureError {
                 write!(f, "study note signature is invalid")
             }
             ScriptureError::BadNote(msg) => write!(f, "bad study note: {msg}"),
+            ScriptureError::Persistence(msg) => write!(f, "persistence error: {msg}"),
             ScriptureError::Storage(e) => write!(f, "storage error: {e}"),
             ScriptureError::Identity(e) => write!(f, "identity error: {e}"),
         }
@@ -57,6 +62,12 @@ impl std::error::Error for ScriptureError {}
 impl From<StorageError> for ScriptureError {
     fn from(e: StorageError) -> Self {
         ScriptureError::Storage(e)
+    }
+}
+
+impl From<std::io::Error> for ScriptureError {
+    fn from(e: std::io::Error) -> Self {
+        ScriptureError::Persistence(e.to_string())
     }
 }
 

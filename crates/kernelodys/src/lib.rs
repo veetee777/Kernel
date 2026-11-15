@@ -23,7 +23,10 @@
 //! [`tuning::play_432`] retunes decoded PCM to 432 before the engine
 //! streams it to a sink in fixed-size chunks. [`playback::WavFileSink`]
 //! renders a track to a real `.wav` file on disk; a device sink
-//! (ALSA, AAudio) is future work, not this build.
+//! (ALSA, AAudio) is future work, not this build. The engine applies a
+//! per-track normalization gain ([`normalize::normalize_gain`]) when
+//! one is set, so tracks recorded at different loudnesses play at the
+//! same peak level without ever clipping.
 //!
 //! Manifest formats (explicit binary, no JSON):
 //! `KTRACK1` + title length (u16 LE) + title bytes + artist length
@@ -50,6 +53,23 @@ pub mod wav;
 /// to a sink in fixed-size chunks, with pause/resume/stop and underrun
 /// counting. See [`playback::PlaybackEngine`].
 pub mod playback;
+
+/// Editable playlists: the working form of a playlist, with add /
+/// remove / reorder and binary save / load. See
+/// [`playlist::PlaylistDoc`].
+pub mod playlist;
+
+/// The play queue: next / previous, seeded shuffle, repeat modes.
+/// See [`queue::PlayQueue`].
+pub mod queue;
+
+/// The library index: scan a content store for WAV tracks and search
+/// by title or artist. See [`library::LibraryIndex`].
+pub mod library;
+
+/// Peak normalization: one gain per track so tracks play at the same
+/// peak level. See [`normalize::normalize_gain`].
+pub mod normalize;
 
 /// Magic bytes at the start of every track manifest.
 const TRACK_MAGIC: &[u8; 7] = b"KTRACK1";
@@ -133,7 +153,9 @@ fn validate_human_name(name: &str, kind: &str) -> Result<(), TrackError> {
         return Err(err(format!("{kind} must not be empty")));
     }
     if name.len() > MAX_NAME_LEN {
-        return Err(err(format!("{kind} must be at most {MAX_NAME_LEN} characters")));
+        return Err(err(format!(
+            "{kind} must be at most {MAX_NAME_LEN} characters"
+        )));
     }
     if name.contains('/') || name.contains('\\') {
         return Err(err(format!("{kind} must not contain a path separator")));
@@ -167,9 +189,8 @@ fn track_sign_message(
     root: &Cid,
     owner: &PeerId,
 ) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(
-        TRACK_SIGN_DOMAIN.len() + title.len() + artist.len() + 8 + 32 + 32,
-    );
+    let mut msg =
+        Vec::with_capacity(TRACK_SIGN_DOMAIN.len() + title.len() + artist.len() + 8 + 32 + 32);
     msg.extend_from_slice(TRACK_SIGN_DOMAIN);
     msg.extend_from_slice(title.as_bytes());
     msg.extend_from_slice(artist.as_bytes());
@@ -291,9 +312,11 @@ impl TrackManifest {
                 "manifest too short for artist length".to_string(),
             ));
         }
-        let artist_len =
-            u16::from_le_bytes(bytes[artist_len_off..artist_len_off + 2].try_into().expect("2-byte slice"))
-                as usize;
+        let artist_len = u16::from_le_bytes(
+            bytes[artist_len_off..artist_len_off + 2]
+                .try_into()
+                .expect("2-byte slice"),
+        ) as usize;
         let expected = artist_len_off + 2 + artist_len + 8 + 32 + 32 + 64;
         if bytes.len() != expected {
             return Err(TrackError::InvalidManifest(format!(
@@ -544,10 +567,7 @@ impl TrackStore {
     /// Fetch a track by manifest CID: verify the manifest signature,
     /// then reassemble the chunked audio (every chunk hash-verified).
     /// Returns the audio bytes and human-readable metadata.
-    pub fn get_track(
-        &self,
-        manifest_cid: &Cid,
-    ) -> Result<(Vec<u8>, TrackMetadata), TrackError> {
+    pub fn get_track(&self, manifest_cid: &Cid) -> Result<(Vec<u8>, TrackMetadata), TrackError> {
         let manifest = match self.tracks.get(manifest_cid) {
             Some(m) => m.clone(),
             None => {
@@ -702,7 +722,9 @@ mod tests {
         assert_eq!(tracks.len(), 2);
         // Same title + artist + duration + content -> same manifest CID.
         assert_eq!(
-            tracks.put_track("Intro", "Nova", 45, small, &alice).unwrap(),
+            tracks
+                .put_track("Intro", "Nova", 45, small, &alice)
+                .unwrap(),
             cid
         );
     }
@@ -772,10 +794,7 @@ mod tests {
         let last = bytes.len() - 1;
         bytes[last] ^= 0xff;
         let bad_cid = tracks.store_mut().put(&bytes);
-        assert_eq!(
-            tracks.get_playlist(&bad_cid),
-            Err(TrackError::BadSignature)
-        );
+        assert_eq!(tracks.get_playlist(&bad_cid), Err(TrackError::BadSignature));
     }
 
     #[test]

@@ -45,6 +45,13 @@
 //! storage under the root CID, and this crate only records the root,
 //! the kind, and the size. A post whose media metadata is missing,
 //! oversized, or of an unknown kind is refused.
+//!
+//! The Korn world is wired in through [`sim_bridge`]: sim events are
+//! published as ordinary signed posts (timestamped with the sim tick,
+//! never the wall clock), so the feed, blocking, and reposts all
+//! apply to them exactly as to any other post.
+
+pub mod sim_bridge;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;

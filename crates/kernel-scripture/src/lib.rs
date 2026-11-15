@@ -29,8 +29,11 @@
 //!   "loved" are different words, and no stemming is done.
 //! - Related-verses is shared-words only, not meaning — and there is
 //!   no stopword list, so common words like "the" count.
-//! - Storage is in-memory (`ContentStore`); nothing here persists to
-//!   disk. Persistence is the caller's job (see `kernel-store-disk`).
+//! - Storage is in-memory (`ContentStore`) by default; durable
+//!   binary persistence lives in [`persistence`]: an append-only
+//!   `scripture.klog` log (hash-verified records, torn tail cut on
+//!   replay) that rebuilds the library exactly. See
+//!   [`ScriptureStore`](persistence::ScriptureStore).
 //! - Verse text is stored as one block per verse; a whole book is
 //!   many blocks, not one.
 
@@ -38,6 +41,7 @@ pub mod concordance;
 pub mod error;
 pub mod library;
 pub mod notes;
+pub mod persistence;
 pub mod query;
 pub mod reference;
 pub mod tokenize;
@@ -46,5 +50,6 @@ pub use concordance::Concordance;
 pub use error::ScriptureError;
 pub use library::{IngestReport, Library, Scope, Verse};
 pub use notes::StudyNote;
+pub use persistence::ScriptureStore;
 pub use query::RelatedVerse;
 pub use reference::{Reference, VerseKey};

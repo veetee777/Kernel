@@ -343,6 +343,17 @@ Android launcher project, not a Rust crate.
 - Storage is 100% free: local files only, no paid service, no
   per-read or per-write charges, ever. Nothing in this workspace
   phones home to a billing meter.
+- Everything inside KERNEL is 100% free for the owner (Tristan):
+  storage, bundles, apps, all services. The owner pays nothing,
+  ever, inside KERNEL. Enforced in the payment path (`k-pay`
+  owner exemption): an owner purchase moves no coins and still
+  issues a valid receipt.
+- HEY•AI is the KERNEL-native personal AI assistant — like Gemini
+  is Google's AI, HEY•AI is KERNEL's AI. It is the assistant
+  itself, not a voice-notes app; voice and rendering are tools it
+  uses.
+- X•Shield is the privacy shield: ad blocking, app tracker
+  blocking, and VPN. It is not a permission-policy system.
 - No facial recognition.
 - Names for humans, not hashes, wherever a human sees an identifier.
 - Preserve existing work; consolidate, don't scatter partial

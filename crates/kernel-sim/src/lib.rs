@@ -188,12 +188,23 @@ impl ResourceKind {
         }
     }
 
-    fn decode(v: u8) -> Option<Self> {
+    /// Decode a resource kind byte (1 food, 2 wood, 3 stone), or `None`
+    /// for any other value. The same codes appear in event payloads.
+    pub fn decode(v: u8) -> Option<Self> {
         match v {
             1 => Some(ResourceKind::Food),
             2 => Some(ResourceKind::Wood),
             3 => Some(ResourceKind::Stone),
             _ => None,
+        }
+    }
+
+    /// Human-readable name: "food", "wood", or "stone".
+    pub fn name(self) -> &'static str {
+        match self {
+            ResourceKind::Food => "food",
+            ResourceKind::Wood => "wood",
+            ResourceKind::Stone => "stone",
         }
     }
 }
@@ -328,6 +339,23 @@ pub struct World {
 fn agent_secret(seed: u64, index: usize) -> [u8; 32] {
     let mut r =
         XorShift64Star::new(seed ^ (0x9E37_79B9_7F4A_7C15u64.wrapping_mul(index as u64 + 1)));
+    let mut out = [0u8; 32];
+    for chunk in out.chunks_mut(8) {
+        chunk.copy_from_slice(&r.next_u64().to_le_bytes());
+    }
+    out
+}
+
+/// Domain for the world's own secret: the first eight bytes of
+/// "KORN-WOR", little-endian. Agent secrets mix the seed with
+/// multiples of the golden-gamma constant instead, so no agent index
+/// can ever produce the world secret.
+const WORLD_SECRET_DOMAIN: u64 = 0x524F_572D_4E52_4F4B;
+
+/// Derive the world's own secret key bytes deterministically from the
+/// seed, under a domain distinct from every agent secret.
+fn world_secret(seed: u64) -> [u8; 32] {
+    let mut r = XorShift64Star::new(seed ^ WORLD_SECRET_DOMAIN);
     let mut out = [0u8; 32];
     for chunk in out.chunks_mut(8) {
         chunk.copy_from_slice(&r.next_u64().to_le_bytes());
@@ -507,6 +535,27 @@ impl World {
     /// All agents, in index order.
     pub fn agents(&self) -> &[Agent] {
         &self.agents
+    }
+
+    /// The signing identity of agent `index`, re-derived
+    /// deterministically from (seed, index, name) — the same identity
+    /// the agent was spawned with, with the same [`PeerId`]. Returns
+    /// `None` when there is no agent at that index. This is how a
+    /// sim agent signs things outside the sim (for example Planet-K
+    /// posts) without any secret ever being stored in a save.
+    pub fn agent_identity(&self, index: usize) -> Option<Identity> {
+        let agent = self.agents.get(index)?;
+        let secret = agent_secret(self.seed, index);
+        Identity::from_secret_bytes(&secret, &agent.name).ok()
+    }
+
+    /// The world's own signing identity, derived deterministically
+    /// from the seed under a domain distinct from every agent secret.
+    /// World events (regrowth) are published under this identity,
+    /// since no agent acts. The display name is "korn-world".
+    pub fn world_identity(&self) -> Result<Identity, SimError> {
+        let secret = world_secret(self.seed);
+        Identity::from_secret_bytes(&secret, "korn-world").map_err(SimError::from)
     }
 
     /// The append-only event log.
@@ -1309,6 +1358,43 @@ mod tests {
             World::new(1, &[""]),
             Err(SimError::InvalidAgentName(_))
         ));
+    }
+
+    #[test]
+    fn agent_and_world_identities_are_deterministic() {
+        let mut w = World::new(1234, &NAMES).unwrap();
+        w.tick_n(10);
+        // Each agent identity re-derives to the stored PeerId.
+        for (i, agent) in w.agents().iter().enumerate() {
+            let id = w.agent_identity(i).expect("agent exists");
+            assert_eq!(id.peer_id(), &agent.id);
+            assert_eq!(id.peer_id().display_name(), agent.name);
+        }
+        assert!(w.agent_identity(NAMES.len()).is_none());
+        // The world identity is stable across save/load and distinct
+        // from every agent identity.
+        let world_id = w.world_identity().unwrap();
+        assert_eq!(world_id.peer_id().display_name(), "korn-world");
+        let loaded = World::load(&w.save()).unwrap();
+        assert_eq!(
+            loaded.world_identity().unwrap().peer_id().public_key(),
+            world_id.peer_id().public_key()
+        );
+        for agent in w.agents() {
+            assert_ne!(world_id.peer_id().public_key(), agent.id.public_key());
+        }
+        // Two worlds with the same seed share the world identity; a
+        // different seed gives a different one.
+        let other = World::new(1234, &NAMES).unwrap();
+        assert_eq!(
+            other.world_identity().unwrap().peer_id().public_key(),
+            world_id.peer_id().public_key()
+        );
+        let different = World::new(99, &NAMES).unwrap();
+        assert_ne!(
+            different.world_identity().unwrap().peer_id().public_key(),
+            world_id.peer_id().public_key()
+        );
     }
 
     #[test]

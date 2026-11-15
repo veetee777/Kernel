@@ -52,6 +52,23 @@
 //! All time is caller-supplied (unix seconds). This crate never
 //! reads the system clock, so a wrong clock means wrong expiries
 //! and wrong due times — that is the caller's responsibility.
+//!
+//! ## OWNER-FREE LAW
+//!
+//! Everything inside KERNEL is 100% free for the owner (Tristan):
+//! he pays nothing, ever. [`PaymentService::set_owner`] registers
+//! the owner's [`PeerId`] on a service; from then on, paying an
+//! invoice as the owner satisfies it without moving any coins — a
+//! valid owner-free [`Receipt`] (amount 0, `owner_free` set, signed
+//! by the payer) is still issued, the invoice is marked paid, and
+//! the payment is recorded with amount 0. Subscription occurrences
+//! for the owner are pre-signed owner-free at registration and
+//! execute free on `tick`. The exemption is local: a service that
+//! does not know the owner charges normally, and this crate does
+//! not decide who the owner is — that is the node's job. The owner
+//! must be registered before a subscription is registered for its
+//! occurrences to be owner-free: the prepaid receipts are signed
+//! at authorization time and cannot be rewritten later.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -66,7 +83,9 @@ const INVOICE_SIGN_DOMAIN: &[u8] = b"KPAY-INV1";
 
 /// Domain separator for receipt signatures: a signature covers
 /// `b"KPAY-RCPT1" || invoice id || payer key || recipient key ||
-/// amount`.
+/// amount || owner-free flag (0 or 1)`. The flag is covered so an
+/// owner-free receipt cannot be turned into a paid one (or the
+/// reverse) without breaking the signature.
 const RECEIPT_SIGN_DOMAIN: &[u8] = b"KPAY-RCPT1";
 
 /// Domain separator for subscription signatures: a signature
@@ -259,6 +278,7 @@ fn receipt_sign_message(
     payer: &PeerId,
     recipient: &PeerId,
     amount: u64,
+    owner_free: bool,
 ) -> Vec<u8> {
     let mut msg = Vec::new();
     msg.extend_from_slice(RECEIPT_SIGN_DOMAIN);
@@ -267,6 +287,7 @@ fn receipt_sign_message(
     msg.extend_from_slice(payer.public_key().as_bytes());
     msg.extend_from_slice(recipient.public_key().as_bytes());
     msg.extend_from_slice(&amount.to_le_bytes());
+    msg.push(owner_free as u8);
     msg
 }
 
@@ -345,19 +366,54 @@ pub struct Receipt {
     pub payer: PeerId,
     /// Who was paid.
     pub recipient: PeerId,
-    /// The amount that moved.
+    /// The amount that moved. For an owner-free receipt this is
+    /// 0 — nothing moved — and `owner_free` is set.
     pub amount: u64,
+    /// True when this receipt is owner-free: the registered owner
+    /// acquired the thing without any coins moving. Covered by
+    /// the payer's signature, so the flag cannot be flipped
+    /// after the fact.
+    pub owner_free: bool,
     /// The payer's signature over invoice id, payer, recipient,
-    /// and amount.
+    /// amount, and the owner-free flag.
     pub signature: Ed25519Signature,
 }
 
 impl Receipt {
+    /// Build an owner-free receipt: proof that the registered
+    /// owner acquired something without any coins moving. The
+    /// amount is 0 and `owner_free` is set; the payer signs the
+    /// flag along with the rest. This is only meaningful when
+    /// the payer really is the registered owner — a
+    /// [`PaymentService`] checks that before issuing one. A
+    /// receipt built by hand proves nothing on its own; what
+    /// makes an owner-free purchase real is the service's
+    /// payment record behind it.
+    pub fn owner_free(invoice_id: &str, payer: &Identity, recipient: &PeerId) -> Self {
+        let payer_id = payer.peer_id().clone();
+        let msg = receipt_sign_message(invoice_id, &payer_id, recipient, 0, true);
+        let signature = payer.sign(&msg);
+        Self {
+            invoice_id: invoice_id.to_string(),
+            payer: payer_id,
+            recipient: recipient.clone(),
+            amount: 0,
+            owner_free: true,
+            signature,
+        }
+    }
+
     /// True if the signature verifies against the payer for this
-    /// exact invoice id, recipient, and amount. Any tampering
-    /// fails this.
+    /// exact invoice id, recipient, amount, and owner-free flag.
+    /// Any tampering fails this.
     pub fn verify(&self) -> bool {
-        let msg = receipt_sign_message(&self.invoice_id, &self.payer, &self.recipient, self.amount);
+        let msg = receipt_sign_message(
+            &self.invoice_id,
+            &self.payer,
+            &self.recipient,
+            self.amount,
+            self.owner_free,
+        );
         self.payer.verify(&msg, &self.signature).is_ok()
     }
 }
@@ -698,6 +754,12 @@ struct SubscriptionState {
 /// service to be payable here.
 pub struct PaymentService {
     ledger: Ledger,
+    /// The registered owner, if any: the peer for whom
+    /// everything inside KERNEL is free (the OWNER-FREE LAW).
+    /// `None` means no owner is registered and everyone pays.
+    /// This crate does not decide who the owner is — the node
+    /// registers them.
+    owner: Option<PeerId>,
     /// Invoices registered through [`PaymentService::create_invoice`].
     invoices: HashMap<String, Invoice>,
     /// Ids of invoices already paid.
@@ -714,16 +776,45 @@ pub struct PaymentService {
 
 impl PaymentService {
     /// Create a payment service whose ledger starts at the given
-    /// genesis allocation.
+    /// genesis allocation. No owner is registered: everyone pays
+    /// until [`PaymentService::set_owner`] is called.
     pub fn new(genesis: &[(PeerId, u64)]) -> Result<Self, PayError> {
         Ok(Self {
             ledger: Ledger::new(genesis)?,
+            owner: None,
             invoices: HashMap::new(),
             paid: HashSet::new(),
             payments: Vec::new(),
             subscriptions: BTreeMap::new(),
             refund_ids: HashSet::new(),
         })
+    }
+
+    /// Register the owner of this node: the peer for whom
+    /// everything inside KERNEL is free (the OWNER-FREE LAW).
+    /// From then on, paying an invoice as the owner satisfies it
+    /// without moving any coins, and subscription occurrences
+    /// for the owner execute free. Register the owner before
+    /// registering a subscription for its occurrences to be
+    /// owner-free: the prepaid receipts are signed at
+    /// registration time and cannot be rewritten later.
+    pub fn set_owner(&mut self, owner: PeerId) {
+        self.owner = Some(owner);
+    }
+
+    /// The registered owner, if any.
+    pub fn owner(&self) -> Option<&PeerId> {
+        self.owner.as_ref()
+    }
+
+    /// True if `peer` is the registered owner. Compares public
+    /// keys, not display names, so a peer id rebuilt from a
+    /// decoded record (which carries a fingerprint name instead
+    /// of the original display name) still matches.
+    pub fn is_owner(&self, peer: &PeerId) -> bool {
+        self.owner
+            .as_ref()
+            .is_some_and(|o| o.public_key() == peer.public_key())
     }
 
     /// The underlying coin ledger.
@@ -769,7 +860,11 @@ impl PaymentService {
     /// and that it has not expired; then settles through the coin
     /// ledger and returns a receipt signed by the payer. A
     /// rejected payment changes nothing — no coins move and the
-    /// invoice stays unpaid.
+    /// invoice stays unpaid. When the payer is the registered
+    /// owner (see the OWNER-FREE LAW), the invoice is satisfied
+    /// without touching the ledger: no coin transaction is
+    /// submitted, an owner-free receipt is issued, and the
+    /// payment is recorded with amount 0.
     pub fn pay_invoice(
         &mut self,
         invoice: &Invoice,
@@ -788,6 +883,29 @@ impl PaymentService {
                 now,
             });
         }
+        if self.is_owner(payer.peer_id()) {
+            // OWNER-FREE LAW: the owner pays nothing. The
+            // invoice is satisfied without touching the ledger:
+            // no coin transaction is submitted and no coins move.
+            // A valid owner-free receipt is still issued, the
+            // invoice is marked paid, and the payment is
+            // recorded with amount 0.
+            self.paid.insert(invoice.id.clone());
+            let receipt = Receipt::owner_free(&invoice.id, payer, &invoice.recipient);
+            self.payments.push(PaymentRecord {
+                payment_id: invoice.id.clone(),
+                invoice_id: invoice.id.clone(),
+                payer: receipt.payer.clone(),
+                payee: receipt.recipient.clone(),
+                amount: 0,
+                paid_at: now,
+                refunded_at: None,
+                status: PaymentStatus::Paid,
+                kind: PaymentKind::Invoice,
+                receipt: receipt.clone(),
+            });
+            return Ok(receipt);
+        }
         // Settle through the ledger: a signed coin transaction
         // from the payer to the recipient, memoed with the
         // invoice id so the payment is recognizable on the ledger.
@@ -796,13 +914,20 @@ impl PaymentService {
         self.ledger.submit(&tx)?;
         self.paid.insert(invoice.id.clone());
         let payer_id = payer.peer_id().clone();
-        let msg = receipt_sign_message(&invoice.id, &payer_id, &invoice.recipient, invoice.amount);
+        let msg = receipt_sign_message(
+            &invoice.id,
+            &payer_id,
+            &invoice.recipient,
+            invoice.amount,
+            false,
+        );
         let signature = payer.sign(&msg);
         let receipt = Receipt {
             invoice_id: invoice.id.clone(),
             payer: payer_id,
             recipient: invoice.recipient.clone(),
             amount: invoice.amount,
+            owner_free: false,
             signature,
         };
         self.payments.push(PaymentRecord {
@@ -860,14 +985,33 @@ impl PaymentService {
             let payment_id = subscription.occurrence_payment_id(n);
             let memo = format!("sub:{payment_id}");
             let tx = CoinTransaction::new(payer, &payee, &memo, subscription.amount)?;
-            let msg = receipt_sign_message(&payment_id, &payer_id, &payee, subscription.amount);
-            let signature = payer.sign(&msg);
-            let receipt = Receipt {
-                invoice_id: payment_id,
-                payer: payer_id.clone(),
-                recipient: payee.clone(),
-                amount: subscription.amount,
-                signature,
+            // An owner subscription's occurrences are owner-free:
+            // the prepaid receipt carries amount 0 and the flag,
+            // so `tick` settles them without moving coins. The
+            // owner must be registered before the subscription is
+            // registered — the receipt is signed here, at
+            // authorization time, and cannot be rewritten later.
+            // The transaction is still built (it is never
+            // submitted for an owner-free occurrence).
+            let receipt = if self.is_owner(&payer_id) {
+                Receipt::owner_free(&payment_id, payer, &payee)
+            } else {
+                let msg = receipt_sign_message(
+                    &payment_id,
+                    &payer_id,
+                    &payee,
+                    subscription.amount,
+                    false,
+                );
+                let signature = payer.sign(&msg);
+                Receipt {
+                    invoice_id: payment_id,
+                    payer: payer_id.clone(),
+                    recipient: payee.clone(),
+                    amount: subscription.amount,
+                    owner_free: false,
+                    signature,
+                }
             };
             prepaid.push((tx, receipt));
         }
@@ -941,7 +1085,19 @@ impl PaymentService {
                     (n, tx, receipt)
                 };
                 let n = due;
-                match self.ledger.submit(&tx) {
+                // An owner-free occurrence never touches the
+                // ledger: its prepaid receipt was authorized as
+                // free at registration, so the occurrence is
+                // settled by recording that receipt. The flag on
+                // the receipt is authoritative here — it was
+                // built under the rules in force at authorization
+                // time, and `tick` holds no key to re-sign one.
+                let submit = if receipt.owner_free {
+                    Ok(())
+                } else {
+                    self.ledger.submit(&tx)
+                };
+                match submit {
                     Ok(()) => {
                         let state = self
                             .subscriptions
@@ -1075,6 +1231,37 @@ impl PaymentService {
             .payments
             .iter_mut()
             .find(|r| r.payment_id == refund.payment_id)
+            .expect("payment still present");
+        record.status = PaymentStatus::Refunded;
+        record.refunded_at = Some(now);
+        Ok(record.clone())
+    }
+
+    /// Void a zero-amount (owner-free) payment: mark its history
+    /// record `Refunded` without moving any coins, because none
+    /// moved in the first place. This is how an owner-free
+    /// escrow dispute is settled — there is nothing to return,
+    /// so there is nothing to refund. Refuses an unknown payment
+    /// id, an already-refunded payment, and any payment whose
+    /// amount is not zero (those must go through
+    /// [`PaymentService::process_refund`]).
+    pub fn void_payment(&mut self, payment_id: &str, now: u64) -> Result<PaymentRecord, PayError> {
+        let Some(record) = self.payments.iter().find(|r| r.payment_id == payment_id) else {
+            return Err(PayError::NotPaid(payment_id.to_string()));
+        };
+        if record.status == PaymentStatus::Refunded {
+            return Err(PayError::AlreadyRefunded(payment_id.to_string()));
+        }
+        if record.amount != 0 {
+            return Err(PayError::InvalidRefund(format!(
+                "payment '{payment_id}' moved {} coins; voiding is only for zero-amount owner-free payments",
+                record.amount
+            )));
+        }
+        let record = self
+            .payments
+            .iter_mut()
+            .find(|r| r.payment_id == payment_id)
             .expect("payment still present");
         record.status = PaymentStatus::Refunded;
         record.refunded_at = Some(now);
@@ -1666,5 +1853,154 @@ mod tests {
         assert_eq!(alice_paid[0].status, PaymentStatus::Refunded);
         assert_eq!(alice_paid[0].refunded_at, Some(40));
         assert_eq!(alice_paid[1].status, PaymentStatus::Paid);
+    }
+
+    // -- OWNER-FREE LAW ------------------------------------------
+
+    /// A fixture with the owner registered: Alice is the owner.
+    fn funded_with_owner() -> (PaymentService, Identity, Identity) {
+        let (mut service, alice, bob) = funded();
+        service.set_owner(alice.peer_id().clone());
+        (service, alice, bob)
+    }
+
+    #[test]
+    fn owner_pays_invoice_free_and_repay_is_still_refused() {
+        let (mut service, alice, bob) = funded_with_owner();
+        assert!(service.is_owner(alice.peer_id()));
+        assert!(!service.is_owner(bob.peer_id()));
+        // Bob invoices the owner for 250.
+        let invoice = service
+            .create_invoice(&bob, "inv-free-001", 250, "coffee", 1_000)
+            .unwrap();
+        let receipt = service.pay_invoice(&invoice, &alice, 500).unwrap();
+        // A valid receipt is still issued, marked owner-free,
+        // with amount moved 0.
+        assert!(receipt.verify());
+        assert!(receipt.owner_free);
+        assert_eq!(receipt.amount, 0);
+        assert_eq!(receipt.payer, *alice.peer_id());
+        assert_eq!(receipt.recipient, *bob.peer_id());
+        assert!(service.is_paid("inv-free-001"));
+        // No coins moved for anyone, and the ledger has no
+        // transaction for it.
+        assert_eq!(service.balance_of(alice.peer_id()), 1_000);
+        assert_eq!(service.balance_of(bob.peer_id()), 100);
+        assert!(service.ledger().transactions().is_empty());
+        // History records the payment with amount 0.
+        let history = service.history_for_payer(alice.peer_id(), 10);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].amount, 0);
+        assert_eq!(history[0].receipt.amount, 0);
+        assert!(history[0].receipt.owner_free);
+        // Paying the same invoice again is still a replay
+        // refusal, and still moves nothing.
+        assert_eq!(
+            service.pay_invoice(&invoice, &alice, 501),
+            Err(PayError::AlreadyPaid("inv-free-001".to_string()))
+        );
+        assert_eq!(service.balance_of(alice.peer_id()), 1_000);
+        assert_eq!(service.balance_of(bob.peer_id()), 100);
+    }
+
+    #[test]
+    fn owner_exemption_only_applies_when_registered() {
+        // No owner registered: the same payer is charged.
+        let (mut service, alice, bob) = funded();
+        assert!(service.owner().is_none());
+        assert!(!service.is_owner(alice.peer_id()));
+        let invoice = service
+            .create_invoice(&bob, "inv-chg-001", 250, "coffee", 1_000)
+            .unwrap();
+        let receipt = service.pay_invoice(&invoice, &alice, 500).unwrap();
+        assert!(!receipt.owner_free);
+        assert_eq!(receipt.amount, 250);
+        assert_eq!(service.balance_of(alice.peer_id()), 750);
+        assert_eq!(service.balance_of(bob.peer_id()), 350);
+        // An owner registered for someone else does not exempt
+        // this payer either.
+        let (mut service, alice, bob) = funded();
+        service.set_owner(bob.peer_id().clone());
+        let invoice = service
+            .create_invoice(&bob, "inv-chg-002", 250, "coffee", 1_000)
+            .unwrap();
+        let receipt = service.pay_invoice(&invoice, &alice, 500).unwrap();
+        assert!(!receipt.owner_free);
+        assert_eq!(service.balance_of(alice.peer_id()), 750);
+        assert_eq!(service.balance_of(bob.peer_id()), 350);
+    }
+
+    #[test]
+    fn owner_subscription_occurrences_execute_free() {
+        let (mut service, alice, bob) = funded_with_owner();
+        let sub = make_sub(&alice, "sub-free-001", bob.peer_id(), 100, 10, 3, 100);
+        service.register_subscription(&alice, &sub).unwrap();
+        let outcomes = service.tick(125);
+        assert_eq!(outcomes.len(), 3);
+        for (n, outcome) in outcomes.iter().enumerate() {
+            match outcome {
+                OccurrenceOutcome::Paid {
+                    occurrence,
+                    receipt,
+                    ..
+                } => {
+                    assert_eq!(*occurrence, n as u32);
+                    assert!(receipt.verify());
+                    assert!(receipt.owner_free);
+                    assert_eq!(receipt.amount, 0);
+                }
+                other => panic!("expected a paid occurrence, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            service.subscription_status("sub-free-001"),
+            Some(SubscriptionStatus::Finished)
+        );
+        assert_eq!(service.subscription_counts("sub-free-001"), Some((3, 3)));
+        // No coins moved for any occurrence.
+        assert_eq!(service.balance_of(alice.peer_id()), 1_000);
+        assert_eq!(service.balance_of(bob.peer_id()), 100);
+        assert!(service.ledger().transactions().is_empty());
+        let history = service.history_for_payer(alice.peer_id(), 10);
+        assert_eq!(history.len(), 3);
+        assert!(history.iter().all(|r| r.amount == 0));
+        assert!(history.iter().all(|r| r.receipt.owner_free));
+    }
+
+    #[test]
+    fn void_payment_voids_owner_free_only() {
+        let (mut service, alice, bob) = funded_with_owner();
+        // An owner-free payment can be voided: the record flips
+        // to Refunded and no coins move.
+        let invoice = service
+            .create_invoice(&bob, "inv-void-001", 250, "coffee", 1_000)
+            .unwrap();
+        service.pay_invoice(&invoice, &alice, 500).unwrap();
+        let record = service.void_payment("inv-void-001", 600).unwrap();
+        assert_eq!(record.status, PaymentStatus::Refunded);
+        assert_eq!(record.refunded_at, Some(600));
+        assert_eq!(record.amount, 0);
+        assert_eq!(service.balance_of(alice.peer_id()), 1_000);
+        assert_eq!(service.balance_of(bob.peer_id()), 100);
+        // Voiding again is refused.
+        assert_eq!(
+            service.void_payment("inv-void-001", 601),
+            Err(PayError::AlreadyRefunded("inv-void-001".to_string()))
+        );
+        // A normal (non-owner) payment cannot be voided: it
+        // moved real coins, so only a real refund settles it.
+        let invoice = service
+            .create_invoice(&alice, "inv-void-002", 100, "tea", 1_000)
+            .unwrap();
+        service.pay_invoice(&invoice, &bob, 500).unwrap();
+        assert!(matches!(
+            service.void_payment("inv-void-002", 600),
+            Err(PayError::InvalidRefund(_))
+        ));
+        // An unknown payment id is a clean error.
+        assert_eq!(
+            service.void_payment("inv-nope-001", 600),
+            Err(PayError::NotPaid("inv-nope-001".to_string()))
+        );
     }
 }

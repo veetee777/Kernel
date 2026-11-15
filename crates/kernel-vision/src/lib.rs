@@ -23,9 +23,12 @@
 //! [`playback::PpmSink`].
 //!
 //! Manifest format (explicit binary, no JSON):
+//!
+//! ```text
 //! `KVIDEO1` + title length (u16 LE) + title bytes + duration (u64 LE)
 //! + width (u32 LE) + height (u32 LE) + chunk root CID (32) + owner
 //! public key (32) + signature (64).
+//! ```
 
 // The playback pipeline: KVFR decoding, YUV->RGB, scaling, player.
 pub mod playback;
@@ -36,6 +39,7 @@ use std::fmt;
 use kernel_crypto::{sha256, Ed25519Signature};
 use kernel_identity::{Identity, IdentityError, PeerId};
 use kernel_storage::{decode_manifest, Cid, ContentStore, StorageError};
+use playback::{encode_ppm, yuv420_to_rgb, YuvDecoder};
 
 /// Magic bytes at the start of every video manifest.
 const MANIFEST_MAGIC: &[u8; 7] = b"KVIDEO1";
@@ -70,6 +74,16 @@ pub enum VideoError {
     BadSignature,
     /// No video with this manifest CID is known here.
     NotFound(Cid),
+    /// No playlist with this id is known here.
+    PlaylistNotFound(String),
+    /// A playlist operation broke the playlist rules.
+    InvalidPlaylist(String),
+    /// A chapter broke the chapter rules.
+    InvalidChapter(String),
+    /// A subtitle line or track broke the subtitle rules.
+    InvalidSubtitle(String),
+    /// A playback step (decoding or converting frames) failed.
+    Playback(String),
 }
 
 impl fmt::Display for VideoError {
@@ -84,6 +98,11 @@ impl fmt::Display for VideoError {
             VideoError::InvalidChunkIndex(i) => write!(f, "chunk index {i} out of range"),
             VideoError::BadSignature => write!(f, "manifest signature is invalid"),
             VideoError::NotFound(cid) => write!(f, "video not found: {cid}"),
+            VideoError::PlaylistNotFound(id) => write!(f, "playlist not found: {id}"),
+            VideoError::InvalidPlaylist(msg) => write!(f, "invalid playlist: {msg}"),
+            VideoError::InvalidChapter(msg) => write!(f, "invalid chapter: {msg}"),
+            VideoError::InvalidSubtitle(msg) => write!(f, "invalid subtitle: {msg}"),
+            VideoError::Playback(msg) => write!(f, "playback error: {msg}"),
         }
     }
 }
@@ -168,9 +187,8 @@ fn manifest_sign_message(
     root: &Cid,
     owner: &PeerId,
 ) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(
-        MANIFEST_SIGN_DOMAIN.len() + title.len() + 8 + 4 + 4 + 32 + 32,
-    );
+    let mut msg =
+        Vec::with_capacity(MANIFEST_SIGN_DOMAIN.len() + title.len() + 8 + 4 + 4 + 32 + 32);
     msg.extend_from_slice(MANIFEST_SIGN_DOMAIN);
     msg.extend_from_slice(title.as_bytes());
     msg.extend_from_slice(&duration_secs.to_le_bytes());
@@ -339,12 +357,147 @@ pub struct VideoMetadata {
     pub chunk_count: usize,
 }
 
+/// A playlist: an ordered list of videos by manifest CID, under a
+/// human-readable id. Videos play in list order; the same video may
+/// appear more than once.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Playlist {
+    /// Human-readable playlist id.
+    pub id: String,
+    /// Human-readable playlist title.
+    pub title: String,
+    /// Manifest CIDs of the videos, in play order.
+    pub videos: Vec<Cid>,
+}
+
+/// A named chapter within a video: a half-open time range
+/// `[start_ms, end_ms)`. Chapters in one video never overlap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Chapter {
+    /// Chapter title.
+    pub title: String,
+    /// Start of the chapter, in milliseconds from the video start.
+    pub start_ms: u64,
+    /// End of the chapter, in milliseconds from the video start.
+    pub end_ms: u64,
+}
+
+/// One timed subtitle line: the text is shown while
+/// `start_ms <= t < end_ms`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubtitleCue {
+    /// Start of the cue, in milliseconds from the video start.
+    pub start_ms: u64,
+    /// End of the cue, in milliseconds from the video start.
+    pub end_ms: u64,
+    /// The text to show.
+    pub text: String,
+}
+
+/// Rules for a chapter: a non-empty title, a non-empty range inside
+/// the video, and no overlap with any chapter already on the video.
+fn validate_chapter(
+    chapter: &Chapter,
+    existing: &[Chapter],
+    duration_ms: u64,
+) -> Result<(), VideoError> {
+    validate_title(&chapter.title).map_err(|e| match e {
+        VideoError::InvalidTitle(msg) => VideoError::InvalidChapter(msg),
+        other => other,
+    })?;
+    if chapter.start_ms >= chapter.end_ms {
+        return Err(VideoError::InvalidChapter(format!(
+            "chapter start {} must be before end {}",
+            chapter.start_ms, chapter.end_ms
+        )));
+    }
+    if chapter.end_ms > duration_ms {
+        return Err(VideoError::InvalidChapter(format!(
+            "chapter end {} is past the video duration {duration_ms} ms",
+            chapter.end_ms
+        )));
+    }
+    for other in existing {
+        if chapter.start_ms < other.end_ms && other.start_ms < chapter.end_ms {
+            return Err(VideoError::InvalidChapter(format!(
+                "chapter {:?} overlaps {:?}",
+                chapter.title, other.title
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Parse a subtitle track: one cue per line, `START-END<TAB>text`,
+/// times in milliseconds. Blank lines are skipped. Cues must be in
+/// order, non-overlapping, inside the video, and carry non-empty
+/// text. A malformed line is an error naming its 1-based line number.
+fn parse_subtitles(text: &str, duration_ms: u64) -> Result<Vec<SubtitleCue>, VideoError> {
+    let mut cues: Vec<SubtitleCue> = Vec::new();
+    for (idx, line) in text.lines().enumerate() {
+        let line_no = idx + 1;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let bad = |msg: String| VideoError::InvalidSubtitle(format!("line {line_no}: {msg}"));
+        let (range, cue_text) = line
+            .split_once('\t')
+            .ok_or_else(|| bad("expected START-END<TAB>text".to_string()))?;
+        let (start_s, end_s) = range
+            .split_once('-')
+            .ok_or_else(|| bad("expected START-END before the tab".to_string()))?;
+        let start_ms: u64 = start_s
+            .parse()
+            .map_err(|_| bad(format!("start {start_s:?} is not a number")))?;
+        let end_ms: u64 = end_s
+            .parse()
+            .map_err(|_| bad(format!("end {end_s:?} is not a number")))?;
+        if cue_text.is_empty() {
+            return Err(bad("subtitle text must not be empty".to_string()));
+        }
+        if start_ms >= end_ms {
+            return Err(bad(format!("start {start_ms} must be before end {end_ms}")));
+        }
+        if end_ms > duration_ms {
+            return Err(bad(format!(
+                "end {end_ms} is past the video duration {duration_ms} ms"
+            )));
+        }
+        if let Some(prev) = cues.last() {
+            if start_ms < prev.end_ms {
+                return Err(bad(format!(
+                    "cue overlaps the previous cue ending at {}",
+                    prev.end_ms
+                )));
+            }
+        }
+        cues.push(SubtitleCue {
+            start_ms,
+            end_ms,
+            text: cue_text.to_string(),
+        });
+    }
+    Ok(cues)
+}
+
 /// A video store: a content store plus an index of manifests.
 /// Videos are addressed by manifest CID; humans see titles.
 pub struct VideoStore {
     store: ContentStore,
     /// Manifests this node holds, by manifest CID.
     manifests: HashMap<Cid, VideoManifest>,
+    /// Playlists this node holds, by playlist id.
+    playlists: HashMap<String, Playlist>,
+    /// Chapters per video, by manifest CID, sorted by start time.
+    chapters: HashMap<Cid, Vec<Chapter>>,
+    /// Subtitle tracks per video, by manifest CID, sorted by start time.
+    subtitles: HashMap<Cid, Vec<SubtitleCue>>,
+}
+
+impl Default for VideoStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl VideoStore {
@@ -353,6 +506,9 @@ impl VideoStore {
         Self {
             store: ContentStore::new(),
             manifests: HashMap::new(),
+            playlists: HashMap::new(),
+            chapters: HashMap::new(),
+            subtitles: HashMap::new(),
         }
     }
 
@@ -415,10 +571,7 @@ impl VideoStore {
     /// Fetch a video by manifest CID: verify the manifest signature,
     /// then reassemble the chunked content (every chunk hash-verified).
     /// Returns the video bytes and human-readable metadata.
-    pub fn get_video(
-        &self,
-        manifest_cid: &Cid,
-    ) -> Result<(Vec<u8>, VideoMetadata), VideoError> {
+    pub fn get_video(&self, manifest_cid: &Cid) -> Result<(Vec<u8>, VideoMetadata), VideoError> {
         let manifest = self.load_manifest(manifest_cid)?;
         let chunk_cids = decode_manifest(&self.store.get(&manifest.root)?)?;
         let data = self
@@ -440,11 +593,7 @@ impl VideoStore {
     /// chunk manifest. The manifest signature is verified first, so a
     /// tampered manifest cannot serve chunks. An out-of-range index is
     /// a clean error, not a panic.
-    pub fn get_chunk(
-        &self,
-        manifest_cid: &Cid,
-        index: usize,
-    ) -> Result<Vec<u8>, VideoError> {
+    pub fn get_chunk(&self, manifest_cid: &Cid, index: usize) -> Result<Vec<u8>, VideoError> {
         let manifest = self.load_manifest(manifest_cid)?;
         let chunk_cids = decode_manifest(&self.store.get(&manifest.root)?)?;
         let chunk_cid = chunk_cids
@@ -473,6 +622,216 @@ impl VideoStore {
         out
     }
 
+    /// Create an empty playlist. The id and title follow the same
+    /// rules as video titles; an id that already exists is refused.
+    pub fn create_playlist(&mut self, id: &str, title: &str) -> Result<(), VideoError> {
+        validate_title(id).map_err(|e| match e {
+            VideoError::InvalidTitle(msg) => VideoError::InvalidPlaylist(msg),
+            other => other,
+        })?;
+        validate_title(title).map_err(|e| match e {
+            VideoError::InvalidTitle(msg) => VideoError::InvalidPlaylist(msg),
+            other => other,
+        })?;
+        if self.playlists.contains_key(id) {
+            return Err(VideoError::InvalidPlaylist(format!(
+                "playlist {id:?} already exists"
+            )));
+        }
+        self.playlists.insert(
+            id.to_string(),
+            Playlist {
+                id: id.to_string(),
+                title: title.to_string(),
+                videos: Vec::new(),
+            },
+        );
+        Ok(())
+    }
+
+    /// The playlist with this id, if this node holds it.
+    pub fn get_playlist(&self, id: &str) -> Result<&Playlist, VideoError> {
+        self.playlists
+            .get(id)
+            .ok_or_else(|| VideoError::PlaylistNotFound(id.to_string()))
+    }
+
+    /// Delete a playlist. The videos in it are untouched.
+    pub fn delete_playlist(&mut self, id: &str) -> Result<(), VideoError> {
+        self.playlists
+            .remove(id)
+            .map(|_| ())
+            .ok_or_else(|| VideoError::PlaylistNotFound(id.to_string()))
+    }
+
+    /// All playlists held, sorted by id for a stable listing.
+    pub fn list_playlists(&self) -> Vec<&Playlist> {
+        let mut out: Vec<&Playlist> = self.playlists.values().collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
+    }
+
+    /// Append a video to a playlist. The video must be known here —
+    /// a playlist referencing an unknown video is refused.
+    pub fn add_to_playlist(
+        &mut self,
+        playlist_id: &str,
+        manifest_cid: &Cid,
+    ) -> Result<(), VideoError> {
+        // Verify the video exists before touching the playlist.
+        self.load_manifest(manifest_cid)?;
+        let playlist = self
+            .playlists
+            .get_mut(playlist_id)
+            .ok_or_else(|| VideoError::PlaylistNotFound(playlist_id.to_string()))?;
+        playlist.videos.push(*manifest_cid);
+        Ok(())
+    }
+
+    /// Remove the first occurrence of a video from a playlist. The
+    /// video must be in the playlist; removing an absent video is a
+    /// clean error.
+    pub fn remove_from_playlist(
+        &mut self,
+        playlist_id: &str,
+        manifest_cid: &Cid,
+    ) -> Result<(), VideoError> {
+        let playlist = self
+            .playlists
+            .get_mut(playlist_id)
+            .ok_or_else(|| VideoError::PlaylistNotFound(playlist_id.to_string()))?;
+        let pos = playlist
+            .videos
+            .iter()
+            .position(|c| c == manifest_cid)
+            .ok_or_else(|| {
+                VideoError::InvalidPlaylist(format!(
+                    "video {manifest_cid} is not in playlist {playlist_id:?}"
+                ))
+            })?;
+        playlist.videos.remove(pos);
+        Ok(())
+    }
+
+    /// Move a video within a playlist from one position to another.
+    /// Both indices must be in range; moving to the same position is
+    /// a no-op.
+    pub fn move_in_playlist(
+        &mut self,
+        playlist_id: &str,
+        from: usize,
+        to: usize,
+    ) -> Result<(), VideoError> {
+        let playlist = self
+            .playlists
+            .get_mut(playlist_id)
+            .ok_or_else(|| VideoError::PlaylistNotFound(playlist_id.to_string()))?;
+        let len = playlist.videos.len();
+        if from >= len {
+            return Err(VideoError::InvalidPlaylist(format!(
+                "position {from} is out of range for a playlist of {len}"
+            )));
+        }
+        if to >= len {
+            return Err(VideoError::InvalidPlaylist(format!(
+                "position {to} is out of range for a playlist of {len}"
+            )));
+        }
+        if from != to {
+            let cid = playlist.videos.remove(from);
+            playlist.videos.insert(to, cid);
+        }
+        Ok(())
+    }
+
+    /// Add a chapter to a video. The video must be known here; the
+    /// chapter must be valid (non-empty title, start before end,
+    /// inside the video) and must not overlap any chapter already on
+    /// the video. Chapters are kept sorted by start time.
+    pub fn add_chapter(&mut self, manifest_cid: &Cid, chapter: Chapter) -> Result<(), VideoError> {
+        let manifest = self.load_manifest(manifest_cid)?;
+        let duration_ms = manifest.duration_secs * 1000;
+        let existing = self.chapters.get(manifest_cid);
+        let empty: &[Chapter] = &[];
+        let existing = existing.map(|v| v.as_slice()).unwrap_or(empty);
+        validate_chapter(&chapter, existing, duration_ms)?;
+        let list = self.chapters.entry(*manifest_cid).or_default();
+        let pos = list
+            .iter()
+            .position(|c| c.start_ms > chapter.start_ms)
+            .unwrap_or(list.len());
+        list.insert(pos, chapter);
+        Ok(())
+    }
+
+    /// All chapters on a video, in start-time order.
+    pub fn chapters_for(&self, manifest_cid: &Cid) -> Result<&[Chapter], VideoError> {
+        self.load_manifest(manifest_cid)?;
+        Ok(self
+            .chapters
+            .get(manifest_cid)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]))
+    }
+
+    /// The chapter covering `ms` on a video, if any: the chapter with
+    /// `start_ms <= ms < end_ms`. Between chapters, or before the
+    /// first, there is none.
+    pub fn chapter_at(&self, manifest_cid: &Cid, ms: u64) -> Result<Option<&Chapter>, VideoError> {
+        let chapters = self.chapters_for(manifest_cid)?;
+        Ok(chapters.iter().find(|c| c.start_ms <= ms && ms < c.end_ms))
+    }
+
+    /// Set a video's subtitle track from text: one cue per line,
+    /// `START-END<TAB>text`, times in milliseconds. Replaces any
+    /// track already on the video. The video must be known here;
+    /// malformed lines are clean errors naming the line number.
+    pub fn add_subtitles(&mut self, manifest_cid: &Cid, text: &str) -> Result<(), VideoError> {
+        let manifest = self.load_manifest(manifest_cid)?;
+        let duration_ms = manifest.duration_secs * 1000;
+        let cues = parse_subtitles(text, duration_ms)?;
+        self.subtitles.insert(*manifest_cid, cues);
+        Ok(())
+    }
+
+    /// The subtitle line active at `ms` on a video, if any: the cue
+    /// with `start_ms <= ms < end_ms`. In a gap between cues, or
+    /// before the first cue, there is none.
+    pub fn subtitle_at(&self, manifest_cid: &Cid, ms: u64) -> Result<Option<&str>, VideoError> {
+        self.load_manifest(manifest_cid)?;
+        let cues = self
+            .subtitles
+            .get(manifest_cid)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        Ok(cues
+            .iter()
+            .find(|c| c.start_ms <= ms && ms < c.end_ms)
+            .map(|c| c.text.as_str()))
+    }
+
+    /// The frame a player would show at `ms` on a video, as PPM
+    /// bytes: the last frame in the stream whose pts is at or before
+    /// `ms`, converted and encoded exactly as [`playback::PpmSink`]
+    /// writes it. Before the first frame's pts there is nothing to
+    /// show, so `None`. The video content must be a KVFR stream;
+    /// anything else is a clean playback error.
+    pub fn thumbnail_at(&self, manifest_cid: &Cid, ms: u64) -> Result<Option<Vec<u8>>, VideoError> {
+        let (data, _) = self.get_video(manifest_cid)?;
+        let frames =
+            YuvDecoder::decode_all(&data).map_err(|e| VideoError::Playback(e.to_string()))?;
+        let mut shown = None;
+        for frame in &frames {
+            if frame.pts_ms() <= ms {
+                shown = Some(frame);
+            }
+        }
+        match shown {
+            None => Ok(None),
+            Some(frame) => Ok(Some(encode_ppm(&yuv420_to_rgb(frame)))),
+        }
+    }
+
     /// Mutable access to the underlying content store. Test-only:
     /// lets tests simulate corruption (see `put_unchecked`).
     #[cfg(test)]
@@ -497,8 +856,7 @@ mod tests {
     fn manifest_encode_decode_round_trip_and_verify() {
         let alice = Identity::generate("alice").unwrap();
         let root = Cid::from_bytes(kernel_crypto::sha256(b"video chunks"));
-        let manifest =
-            VideoManifest::new("Launch", 3600, 1920, 1080, root, &alice).unwrap();
+        let manifest = VideoManifest::new("Launch", 3600, 1920, 1080, root, &alice).unwrap();
         assert!(manifest.verify());
         let encoded = manifest.encode();
         let decoded = VideoManifest::decode(&encoded).unwrap();
@@ -557,7 +915,10 @@ mod tests {
         assert_eq!(chunk0, &data[..256 * 1024]);
         assert_eq!(chunk1, &data[256 * 1024..512 * 1024]);
         assert_eq!(chunk2, &data[512 * 1024..]);
-        assert_eq!(videos.get_chunk(&cid, 3), Err(VideoError::InvalidChunkIndex(3)));
+        assert_eq!(
+            videos.get_chunk(&cid, 3),
+            Err(VideoError::InvalidChunkIndex(3))
+        );
         // The chunks reassemble to the whole video.
         let mut reassembled = Vec::new();
         reassembled.extend_from_slice(&chunk0);
@@ -595,10 +956,7 @@ mod tests {
             other => panic!("expected CorruptChunk, got {other:?}"),
         }
         // The untouched chunk still reads fine.
-        assert_eq!(
-            videos.get_chunk(&cid, 0).unwrap(),
-            &data[..256 * 1024]
-        );
+        assert_eq!(videos.get_chunk(&cid, 0).unwrap(), &data[..256 * 1024]);
     }
 
     #[test]
@@ -628,8 +986,7 @@ mod tests {
     fn tampered_metadata_breaks_signature() {
         let alice = Identity::generate("alice").unwrap();
         let root = Cid::from_bytes(kernel_crypto::sha256(b"chunks"));
-        let mut manifest =
-            VideoManifest::new("A", 60, 640, 480, root, &alice).unwrap();
+        let mut manifest = VideoManifest::new("A", 60, 640, 480, root, &alice).unwrap();
         assert!(manifest.verify());
         manifest.width = 1280;
         assert!(!manifest.verify());
@@ -643,9 +1000,15 @@ mod tests {
         let alice = Identity::generate("alice").unwrap();
         let mut videos = VideoStore::new();
         assert!(videos.list_videos().is_empty());
-        videos.put_video("Zulu", 60, 640, 480, b"1", &alice).unwrap();
-        videos.put_video("Alpha", 60, 640, 480, b"2", &alice).unwrap();
-        videos.put_video("Mike", 60, 640, 480, b"3", &alice).unwrap();
+        videos
+            .put_video("Zulu", 60, 640, 480, b"1", &alice)
+            .unwrap();
+        videos
+            .put_video("Alpha", 60, 640, 480, b"2", &alice)
+            .unwrap();
+        videos
+            .put_video("Mike", 60, 640, 480, b"3", &alice)
+            .unwrap();
         let listed = videos.list_videos();
         let titles: Vec<&str> = listed.iter().map(|(_, t)| t.as_str()).collect();
         assert_eq!(titles, vec!["Alpha", "Mike", "Zulu"]);
@@ -655,24 +1018,14 @@ mod tests {
     fn title_duration_and_dimension_rules() {
         let alice = Identity::generate("alice").unwrap();
         let mut videos = VideoStore::new();
-        assert!(videos
-            .put_video("", 60, 640, 480, b"x", &alice)
-            .is_err());
-        assert!(videos
-            .put_video("a/b", 60, 640, 480, b"x", &alice)
-            .is_err());
-        assert!(videos
-            .put_video("Ok", 0, 640, 480, b"x", &alice)
-            .is_err());
-        assert!(videos
-            .put_video("Ok", 60, 0, 480, b"x", &alice)
-            .is_err());
+        assert!(videos.put_video("", 60, 640, 480, b"x", &alice).is_err());
+        assert!(videos.put_video("a/b", 60, 640, 480, b"x", &alice).is_err());
+        assert!(videos.put_video("Ok", 0, 640, 480, b"x", &alice).is_err());
+        assert!(videos.put_video("Ok", 60, 0, 480, b"x", &alice).is_err());
         assert!(videos
             .put_video("Ok", 60, MAX_DIMENSION + 1, 480, b"x", &alice)
             .is_err());
-        assert!(videos
-            .put_video("Ok", 60, 640, 480, b"x", &alice)
-            .is_ok());
+        assert!(videos.put_video("Ok", 60, 640, 480, b"x", &alice).is_ok());
     }
 
     #[test]
@@ -680,9 +1033,363 @@ mod tests {
         let videos = VideoStore::new();
         let cid = Cid::from_bytes(kernel_crypto::sha256(b"never stored"));
         assert_eq!(videos.get_video(&cid), Err(VideoError::NotFound(cid)));
+        assert_eq!(videos.get_chunk(&cid, 0), Err(VideoError::NotFound(cid)));
+    }
+
+    /// A 4x2 KVFR frame with a solid luma value, neutral chroma.
+    fn kvfr_frame(pts: u64, y: u8) -> crate::playback::Frame {
+        crate::playback::Frame::new(4, 2, pts, vec![y; 8], vec![128; 2], vec![128; 2]).unwrap()
+    }
+
+    /// Encode frames into one KVFR stream.
+    fn kvfr_stream(frames: &[crate::playback::Frame]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for f in frames {
+            out.extend_from_slice(&crate::playback::encode_frame(f).unwrap());
+        }
+        out
+    }
+
+    #[test]
+    fn playlist_add_remove_reorder() {
+        let alice = Identity::generate("alice").unwrap();
+        let mut videos = VideoStore::new();
+        let a = videos.put_video("A", 60, 640, 480, b"1", &alice).unwrap();
+        let b = videos.put_video("B", 60, 640, 480, b"2", &alice).unwrap();
+        let c = videos.put_video("C", 60, 640, 480, b"3", &alice).unwrap();
+        videos.create_playlist("favs", "Favourites").unwrap();
+        // Duplicate id refused.
+        assert!(matches!(
+            videos.create_playlist("favs", "Again"),
+            Err(VideoError::InvalidPlaylist(_))
+        ));
+        // Unknown playlist refused.
         assert_eq!(
-            videos.get_chunk(&cid, 0),
-            Err(VideoError::NotFound(cid))
+            videos.add_to_playlist("nope", &a),
+            Err(VideoError::PlaylistNotFound("nope".to_string()))
+        );
+        // A playlist referencing an unknown video is refused.
+        let ghost = Cid::from_bytes(kernel_crypto::sha256(b"ghost"));
+        assert_eq!(
+            videos.add_to_playlist("favs", &ghost),
+            Err(VideoError::NotFound(ghost))
+        );
+        videos.add_to_playlist("favs", &a).unwrap();
+        videos.add_to_playlist("favs", &b).unwrap();
+        videos.add_to_playlist("favs", &c).unwrap();
+        assert_eq!(videos.get_playlist("favs").unwrap().videos, vec![a, b, c]);
+        // Move C to the front.
+        videos.move_in_playlist("favs", 2, 0).unwrap();
+        assert_eq!(videos.get_playlist("favs").unwrap().videos, vec![c, a, b]);
+        // Out-of-range moves refused.
+        assert!(videos.move_in_playlist("favs", 3, 0).is_err());
+        assert!(videos.move_in_playlist("favs", 0, 3).is_err());
+        // Remove the middle video.
+        videos.remove_from_playlist("favs", &a).unwrap();
+        assert_eq!(videos.get_playlist("favs").unwrap().videos, vec![c, b]);
+        // Removing it again is an error.
+        assert!(matches!(
+            videos.remove_from_playlist("favs", &a),
+            Err(VideoError::InvalidPlaylist(_))
+        ));
+        // Listing and deletion.
+        assert_eq!(videos.list_playlists().len(), 1);
+        videos.delete_playlist("favs").unwrap();
+        assert!(videos.list_playlists().is_empty());
+        assert_eq!(
+            videos.get_playlist("favs"),
+            Err(VideoError::PlaylistNotFound("favs".to_string()))
+        );
+    }
+
+    #[test]
+    fn chapters_resolve_and_overlaps_are_refused() {
+        let alice = Identity::generate("alice").unwrap();
+        let mut videos = VideoStore::new();
+        // 10-second video.
+        let cid = videos
+            .put_video("Short", 10, 640, 480, b"x", &alice)
+            .unwrap();
+        // Unknown video refused.
+        let ghost = Cid::from_bytes(kernel_crypto::sha256(b"ghost"));
+        assert_eq!(
+            videos.add_chapter(
+                &ghost,
+                Chapter {
+                    title: "X".into(),
+                    start_ms: 0,
+                    end_ms: 1000
+                }
+            ),
+            Err(VideoError::NotFound(ghost))
+        );
+        videos
+            .add_chapter(
+                &cid,
+                Chapter {
+                    title: "Intro".into(),
+                    start_ms: 0,
+                    end_ms: 2000,
+                },
+            )
+            .unwrap();
+        videos
+            .add_chapter(
+                &cid,
+                Chapter {
+                    title: "Main".into(),
+                    start_ms: 2000,
+                    end_ms: 8000,
+                },
+            )
+            .unwrap();
+        // Touching the boundary is fine (half-open ranges).
+        videos
+            .add_chapter(
+                &cid,
+                Chapter {
+                    title: "Outro".into(),
+                    start_ms: 8000,
+                    end_ms: 10000,
+                },
+            )
+            .unwrap();
+        // Overlap refused.
+        assert!(matches!(
+            videos.add_chapter(
+                &cid,
+                Chapter {
+                    title: "Clash".into(),
+                    start_ms: 1500,
+                    end_ms: 3000
+                }
+            ),
+            Err(VideoError::InvalidChapter(_))
+        ));
+        // Empty range and past-the-end refused.
+        assert!(matches!(
+            videos.add_chapter(
+                &cid,
+                Chapter {
+                    title: "Bad".into(),
+                    start_ms: 5000,
+                    end_ms: 5000
+                }
+            ),
+            Err(VideoError::InvalidChapter(_))
+        ));
+        assert!(matches!(
+            videos.add_chapter(
+                &cid,
+                Chapter {
+                    title: "Long".into(),
+                    start_ms: 9000,
+                    end_ms: 11000
+                }
+            ),
+            Err(VideoError::InvalidChapter(_))
+        ));
+        // chapter_at: start inclusive, end exclusive.
+        assert_eq!(videos.chapter_at(&cid, 0).unwrap().unwrap().title, "Intro");
+        assert_eq!(
+            videos.chapter_at(&cid, 1999).unwrap().unwrap().title,
+            "Intro"
+        );
+        assert_eq!(
+            videos.chapter_at(&cid, 2000).unwrap().unwrap().title,
+            "Main"
+        );
+        assert_eq!(
+            videos.chapter_at(&cid, 9999).unwrap().unwrap().title,
+            "Outro"
+        );
+        assert!(videos.chapter_at(&cid, 10000).unwrap().is_none());
+        // Chapters stay sorted even when added out of order.
+        let cid2 = videos
+            .put_video("Other", 10, 640, 480, b"y", &alice)
+            .unwrap();
+        videos
+            .add_chapter(
+                &cid2,
+                Chapter {
+                    title: "Late".into(),
+                    start_ms: 5000,
+                    end_ms: 9000,
+                },
+            )
+            .unwrap();
+        videos
+            .add_chapter(
+                &cid2,
+                Chapter {
+                    title: "Early".into(),
+                    start_ms: 0,
+                    end_ms: 1000,
+                },
+            )
+            .unwrap();
+        let titles: Vec<&str> = videos
+            .chapters_for(&cid2)
+            .unwrap()
+            .iter()
+            .map(|c| c.title.as_str())
+            .collect();
+        assert_eq!(titles, vec!["Early", "Late"]);
+    }
+
+    #[test]
+    fn subtitles_align_to_time_and_gaps_are_none() {
+        let alice = Identity::generate("alice").unwrap();
+        let mut videos = VideoStore::new();
+        let cid = videos
+            .put_video("Short", 10, 640, 480, b"x", &alice)
+            .unwrap();
+        let track = "0-2000\tHello there\n3000-5000\tAnd now this\n";
+        videos.add_subtitles(&cid, track).unwrap();
+        assert_eq!(videos.subtitle_at(&cid, 0).unwrap(), Some("Hello there"));
+        assert_eq!(videos.subtitle_at(&cid, 1999).unwrap(), Some("Hello there"));
+        // Gap between cues: nothing.
+        assert_eq!(videos.subtitle_at(&cid, 2000).unwrap(), None);
+        assert_eq!(videos.subtitle_at(&cid, 2999).unwrap(), None);
+        assert_eq!(
+            videos.subtitle_at(&cid, 3000).unwrap(),
+            Some("And now this")
+        );
+        assert_eq!(videos.subtitle_at(&cid, 5000).unwrap(), None);
+        // Unknown video refused.
+        let ghost = Cid::from_bytes(kernel_crypto::sha256(b"ghost"));
+        assert_eq!(
+            videos.subtitle_at(&ghost, 0),
+            Err(VideoError::NotFound(ghost))
+        );
+    }
+
+    #[test]
+    fn subtitle_malformed_lines_are_clean_errors() {
+        let alice = Identity::generate("alice").unwrap();
+        let mut videos = VideoStore::new();
+        let cid = videos
+            .put_video("Short", 10, 640, 480, b"x", &alice)
+            .unwrap();
+        // Missing tab.
+        assert!(matches!(
+            videos.add_subtitles(&cid, "0-2000 Hello"),
+            Err(VideoError::InvalidSubtitle(_))
+        ));
+        // Missing dash.
+        assert!(matches!(
+            videos.add_subtitles(&cid, "02000\tHello"),
+            Err(VideoError::InvalidSubtitle(_))
+        ));
+        // Non-numeric time.
+        assert!(matches!(
+            videos.add_subtitles(&cid, "soon-2000\tHello"),
+            Err(VideoError::InvalidSubtitle(_))
+        ));
+        // Empty text.
+        assert!(matches!(
+            videos.add_subtitles(&cid, "0-2000\t"),
+            Err(VideoError::InvalidSubtitle(_))
+        ));
+        // Backwards range.
+        assert!(matches!(
+            videos.add_subtitles(&cid, "2000-1000\tHello"),
+            Err(VideoError::InvalidSubtitle(_))
+        ));
+        // Overlapping cues.
+        assert!(matches!(
+            videos.add_subtitles(&cid, "0-2000\tOne\n1500-3000\tTwo"),
+            Err(VideoError::InvalidSubtitle(_))
+        ));
+        // Out of order.
+        assert!(matches!(
+            videos.add_subtitles(&cid, "3000-4000\tTwo\n0-1000\tOne"),
+            Err(VideoError::InvalidSubtitle(_))
+        ));
+        // Past the end of the video.
+        assert!(matches!(
+            videos.add_subtitles(&cid, "9000-11000\tToo far"),
+            Err(VideoError::InvalidSubtitle(_))
+        ));
+        // A failed add leaves no track behind.
+        assert_eq!(videos.subtitle_at(&cid, 100).unwrap(), None);
+        // Blank lines are skipped, and a good track still lands.
+        videos.add_subtitles(&cid, "\n0-1000\tHi\n\n").unwrap();
+        assert_eq!(videos.subtitle_at(&cid, 500).unwrap(), Some("Hi"));
+    }
+
+    #[test]
+    fn thumbnail_matches_the_frame_the_player_would_show() {
+        let alice = Identity::generate("alice").unwrap();
+        let mut videos = VideoStore::new();
+        // Frames at pts 0 (black), 100 (white), 200 (mid grey).
+        let frames = vec![
+            kvfr_frame(0, 16),
+            kvfr_frame(100, 235),
+            kvfr_frame(200, 128),
+        ];
+        let stream = kvfr_stream(&frames);
+        let cid = videos
+            .put_video("Thumbs", 10, 4, 2, &stream, &alice)
+            .unwrap();
+        let expected = |pts: u64, y: u8| {
+            let f = kvfr_frame(pts, y);
+            crate::playback::encode_ppm(&crate::playback::yuv420_to_rgb(&f))
+        };
+        // At 150 ms the player shows the frame due at 100 ms.
+        assert_eq!(
+            videos.thumbnail_at(&cid, 150).unwrap().unwrap(),
+            expected(100, 235)
+        );
+        // At 0 ms it shows the first frame; at 99 ms still the first.
+        assert_eq!(
+            videos.thumbnail_at(&cid, 0).unwrap().unwrap(),
+            expected(0, 16)
+        );
+        assert_eq!(
+            videos.thumbnail_at(&cid, 99).unwrap().unwrap(),
+            expected(0, 16)
+        );
+        // At 200 ms and beyond it shows the last frame.
+        assert_eq!(
+            videos.thumbnail_at(&cid, 200).unwrap().unwrap(),
+            expected(200, 128)
+        );
+        assert_eq!(
+            videos.thumbnail_at(&cid, 9999).unwrap().unwrap(),
+            expected(200, 128)
+        );
+    }
+
+    #[test]
+    fn thumbnail_before_the_first_frame_is_none() {
+        let alice = Identity::generate("alice").unwrap();
+        let mut videos = VideoStore::new();
+        // First frame is not due until 500 ms.
+        let frames = vec![kvfr_frame(500, 16), kvfr_frame(600, 235)];
+        let stream = kvfr_stream(&frames);
+        let cid = videos.put_video("Late", 10, 4, 2, &stream, &alice).unwrap();
+        assert_eq!(videos.thumbnail_at(&cid, 0).unwrap(), None);
+        assert_eq!(videos.thumbnail_at(&cid, 499).unwrap(), None);
+        assert!(videos.thumbnail_at(&cid, 500).unwrap().is_some());
+    }
+
+    #[test]
+    fn thumbnail_of_non_kvfr_content_is_a_clean_error() {
+        let alice = Identity::generate("alice").unwrap();
+        let mut videos = VideoStore::new();
+        let cid = videos
+            .put_video("NotKvfr", 10, 4, 2, b"fake mp4 bytes", &alice)
+            .unwrap();
+        assert!(matches!(
+            videos.thumbnail_at(&cid, 0),
+            Err(VideoError::Playback(_))
+        ));
+        // Unknown video is still NotFound, not a playback error.
+        let ghost = Cid::from_bytes(kernel_crypto::sha256(b"ghost"));
+        assert_eq!(
+            videos.thumbnail_at(&ghost, 0),
+            Err(VideoError::NotFound(ghost))
         );
     }
 }

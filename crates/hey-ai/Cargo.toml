@@ -9,3 +9,4 @@ description = "HEY•AI: signed voice notes and voice commands with a small fixe
 kernel-crypto = { path = "../kernel-crypto" }
 kernel-identity = { path = "../kernel-identity" }
 kernel-storage = { path = "../kernel-storage" }
+kernelodys = { path = "../kernelodys" }

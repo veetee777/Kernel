@@ -470,7 +470,11 @@ impl<'a> Tool for ShowBundleTool<'a> {
 /// creator's invoice for the bundle's price is paid through K•Pay /
 /// X•Koin from the buyer's balance, and the buyer receives the
 /// manifest and its item CIDs. A free bundle (price zero) is
-/// delivered without payment. The invoice id is
+/// delivered without payment. When the buyer is the registered
+/// owner of the agent's payment service (see
+/// [`LocalAgent::set_owner`]), the purchase is owner-free under
+/// the OWNER-FREE LAW: the invoice is satisfied without moving
+/// any coins. The invoice id is
 /// `buy-<bundle-id>-<buyer-fingerprint>`; an already-paid invoice
 /// means this buyer already bought this bundle, and the purchase is
 /// refused instead of charging twice. A failed payment — bad
@@ -572,13 +576,21 @@ impl<'a> Tool for BuyBundleTool<'a> {
             }
         };
         let receipt = self.pay.pay_invoice(&invoice, buyer_signer, u64::MAX)?;
+        // An owner-free purchase is marked as such in the output:
+        // the receipt says so, and no coins moved.
+        let free_note = if receipt.owner_free {
+            " (owner-free — no coins moved)"
+        } else {
+            ""
+        };
         Ok(format!(
-            "bought {}:\n{}\nreceipt: {} paid by {} to {}",
+            "bought {}:\n{}\nreceipt: {} paid by {} to {}{}",
             cid.to_hex(),
             format_manifest(&manifest),
             receipt.invoice_id,
             receipt.payer.display_name(),
-            receipt.recipient.display_name()
+            receipt.recipient.display_name(),
+            free_note
         ))
     }
 }
@@ -815,6 +827,16 @@ impl LocalAgent {
         let peer = identity.peer_id().clone();
         lock(&self.signers).insert(*peer.public_key().as_bytes(), identity);
         peer
+    }
+
+    /// Register the owner of this node on the agent's payment
+    /// service: the peer for whom everything inside KERNEL is free
+    /// (the OWNER-FREE LAW). Owner bundle purchases then go through
+    /// the exempt path in K•Pay — no coins move. Must be set before
+    /// the owner registers a subscription for its occurrences to
+    /// be owner-free (see K•Pay).
+    pub fn set_owner(&self, owner: PeerId) {
+        lock(&self.pay).set_owner(owner);
     }
 
     /// Store bytes in the agent's content store, returning their CID.
@@ -1280,6 +1302,38 @@ mod tests {
         assert!(service.run_task("t2", &f.agent, &provider_id).is_err());
         assert_eq!(f.agent.balance_of(&f.buyer_peer), 9_500);
         assert_eq!(f.agent.balance_of(&f.creator_peer), 500);
+    }
+
+    #[test]
+    fn owner_buys_paid_bundle_free() {
+        let f = fixture();
+        let provider_id = Identity::generate("provider").unwrap();
+        let mut service = AiService::new();
+        let cid = assemble_in(&f, &mut service, &provider_id);
+        // The buyer is the registered owner: the paid bundle is
+        // free for them under the OWNER-FREE LAW.
+        f.agent.set_owner(f.buyer_peer.clone());
+        assert_eq!(f.agent.balance_of(&f.buyer_peer), 10_000);
+        assert_eq!(f.agent.balance_of(&f.creator_peer), 0);
+        service
+            .submit_task("t1", &format!("bundle buy {}", cid.to_hex()), &f.buyer)
+            .unwrap();
+        let text = run_task_text(&mut service, &f.agent, &provider_id, "t1").unwrap();
+        assert!(text.contains("bought"));
+        assert!(text.contains(&cid.to_hex()));
+        assert!(text.contains("opening-track (track)"));
+        assert!(text.contains("owner-free"));
+        // No coins moved for anyone.
+        assert_eq!(f.agent.balance_of(&f.buyer_peer), 10_000);
+        assert_eq!(f.agent.balance_of(&f.creator_peer), 0);
+        // Buying the same bundle twice is still refused, not
+        // delivered twice.
+        service
+            .submit_task("t2", &format!("bundle buy {}", cid.to_hex()), &f.buyer)
+            .unwrap();
+        assert!(service.run_task("t2", &f.agent, &provider_id).is_err());
+        assert_eq!(f.agent.balance_of(&f.buyer_peer), 10_000);
+        assert_eq!(f.agent.balance_of(&f.creator_peer), 0);
     }
 
     #[test]

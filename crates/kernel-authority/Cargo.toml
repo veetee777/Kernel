@@ -1,0 +1,10 @@
+[package]
+name = "kernel-authority"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "KERNEL owner override authority: the registered owner can override any hard rule, with every override recorded in a hash-chained binary audit log"
+
+[dependencies]
+kernel-crypto = { path = "../kernel-crypto" }
+kernel-identity = { path = "../kernel-identity" }

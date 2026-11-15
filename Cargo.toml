@@ -39,6 +39,7 @@ members = [
   "crates/kernel-scripture",
   "crates/kernel-artifacts",
   "crates/k-store",
+  "crates/kernel-authority",
 ]
 
 [workspace.dependencies]

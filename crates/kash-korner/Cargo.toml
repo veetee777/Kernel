@@ -9,3 +9,4 @@ description = "Kash•Korner: a simple signed store/marketplace settled on X•K
 kernel-crypto = { path = "../kernel-crypto" }
 kernel-identity = { path = "../kernel-identity" }
 x-koin = { path = "../x-koin" }
+k-pay = { path = "../k-pay" }

@@ -58,6 +58,15 @@
 //! shown late, and frames are never presented out of pts order. There
 //! is **no audio sync** yet — there is no audio track in a KVFR stream
 //! to sync to.
+//!
+//! The clock is injectable: [`VideoPlayer::new`] uses the wall clock,
+//! while [`VideoPlayer::with_clock`] takes any [`Clock`]. Tests use
+//! [`ManualClock`], whose time advances only when the player sleeps,
+//! so playback timing is fully deterministic and independent of
+//! scheduler jitter — a wall clock on a loaded machine can deschedule
+//! the player thread for more than one frame duration, which is a
+//! scheduling fact, not a playback bug, and must never fail a test
+//! about ordering and drop logic.
 
 use std::fmt;
 use std::fs::File;
@@ -115,6 +124,83 @@ impl std::error::Error for PlaybackError {}
 impl From<std::io::Error> for PlaybackError {
     fn from(e: std::io::Error) -> Self {
         PlaybackError::Io(e)
+    }
+}
+
+/// A clock for the frame timer: monotonic time plus sleep.
+///
+/// Production uses the wall clock; tests use a manual clock that
+/// advances only when the player sleeps, so playback timing is
+/// deterministic and independent of scheduler jitter.
+pub trait Clock: Send {
+    /// Monotonic time since the clock was created.
+    fn now(&self) -> Duration;
+    /// Sleep for `duration` (a real sleep on the wall clock; a virtual
+    /// advance of the same length on a manual clock).
+    fn sleep(&self, duration: Duration);
+}
+
+/// The real clock: [`Instant`] plus [`std::thread::sleep`].
+pub struct RealClock {
+    start: Instant,
+}
+
+impl RealClock {
+    /// A clock starting now.
+    pub fn new() -> Self {
+        Self {
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Default for RealClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clock for RealClock {
+    fn now(&self) -> Duration {
+        self.start.elapsed()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+/// A manual clock for tests: time advances only when `sleep` is
+/// called, by exactly the slept duration. Cheap to clone; clones
+/// share the same virtual time.
+#[derive(Clone, Debug)]
+pub struct ManualClock {
+    millis: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ManualClock {
+    /// A clock starting at zero.
+    pub fn new() -> Self {
+        Self {
+            millis: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+}
+
+impl Default for ManualClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clock for ManualClock {
+    fn now(&self) -> Duration {
+        Duration::from_millis(self.millis.load(Ordering::SeqCst))
+    }
+
+    fn sleep(&self, duration: Duration) {
+        self.millis
+            .fetch_add(duration.as_millis() as u64, Ordering::SeqCst);
     }
 }
 
@@ -477,6 +563,17 @@ pub trait FrameSink {
     fn present(&mut self, frame: &RgbFrame) -> Result<(), PlaybackError>;
 }
 
+/// Encode one RGB frame as a PPM (P6) file's bytes: the header plus
+/// raw RGB24 data. The same encoding [`PpmSink`] writes to disk, so a
+/// thumbnail and a written file for the same frame can never drift
+/// apart.
+pub fn encode_ppm(frame: &RgbFrame) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + frame.data().len());
+    out.extend_from_slice(format!("P6\n{} {}\n255\n", frame.width(), frame.height()).as_bytes());
+    out.extend_from_slice(frame.data());
+    out
+}
+
 /// A sink that writes each presented frame as a PPM (P6) file in a
 /// directory: `frame_000000.ppm`, `frame_000001.ppm`, and so on, in
 /// presentation order. The directory is created if it does not exist.
@@ -510,8 +607,7 @@ impl FrameSink for PpmSink {
     fn present(&mut self, frame: &RgbFrame) -> Result<(), PlaybackError> {
         let path = self.dir.join(format!("frame_{:06}.ppm", self.count));
         let mut file = File::create(&path)?;
-        write!(file, "P6\n{} {}\n255\n", frame.width(), frame.height())?;
-        file.write_all(frame.data())?;
+        file.write_all(&encode_ppm(frame))?;
         self.count += 1;
         Ok(())
     }
@@ -588,6 +684,7 @@ pub struct VideoPlayer<S: FrameSink> {
     target_w: u32,
     target_h: u32,
     control: PlayerControl,
+    clock: Box<dyn Clock>,
 }
 
 impl<S: FrameSink> VideoPlayer<S> {
@@ -618,7 +715,24 @@ impl<S: FrameSink> VideoPlayer<S> {
                 paused: Arc::new(AtomicBool::new(false)),
                 stopped: Arc::new(AtomicBool::new(false)),
             },
+            clock: Box::new(RealClock::new()),
         })
+    }
+
+    /// Build a player with an explicit clock. Identical to [`Self::new`]
+    /// except the frame timer reads `clock` instead of the wall clock.
+    /// Tests pass a [`ManualClock`] so playback timing is
+    /// deterministic; production code uses [`Self::new`].
+    pub fn with_clock(
+        sink: S,
+        fps: u32,
+        target_w: u32,
+        target_h: u32,
+        clock: Box<dyn Clock>,
+    ) -> Result<Self, PlaybackError> {
+        let mut player = Self::new(sink, fps, target_w, target_h)?;
+        player.clock = clock;
+        Ok(player)
     }
 
     /// A control handle for pausing, resuming, and stopping this player
@@ -632,7 +746,7 @@ impl<S: FrameSink> VideoPlayer<S> {
     /// error instead of a report.
     pub fn play_frames(&mut self, frames: &[Frame]) -> Result<PlaybackReport, PlaybackError> {
         let frame_duration = Duration::from_millis(1000 / self.fps as u64);
-        let start = Instant::now();
+        let start = self.clock.now();
         let mut pause_offset = Duration::ZERO;
         let mut presented = 0usize;
         let mut dropped = 0usize;
@@ -660,7 +774,7 @@ impl<S: FrameSink> VideoPlayer<S> {
                     break 'frames;
                 }
                 if self.control.is_paused() {
-                    let paused_since = Instant::now();
+                    let paused_since = self.clock.now();
                     loop {
                         if self.control.is_stopped() {
                             break 'frames;
@@ -668,22 +782,23 @@ impl<S: FrameSink> VideoPlayer<S> {
                         if !self.control.is_paused() {
                             break;
                         }
-                        std::thread::sleep(Duration::from_millis(2));
+                        self.clock.sleep(Duration::from_millis(2));
                     }
-                    pause_offset += paused_since.elapsed();
+                    pause_offset += self.clock.now() - paused_since;
                     continue;
                 }
                 let due = start + pause_offset + Duration::from_millis(pts_offset);
-                let now = Instant::now();
+                let now = self.clock.now();
                 if now >= due {
                     break;
                 }
                 let remaining = due - now;
-                std::thread::sleep(std::cmp::min(remaining, Duration::from_millis(2)));
+                self.clock
+                    .sleep(std::cmp::min(remaining, Duration::from_millis(2)));
             }
             // Too late: more than one frame-duration past its due time.
             let due = start + pause_offset + Duration::from_millis(pts_offset);
-            if Instant::now() > due + frame_duration {
+            if self.clock.now() > due + frame_duration {
                 dropped += 1;
                 continue;
             }
@@ -1036,11 +1151,19 @@ mod tests {
 
     #[test]
     fn player_presents_in_order_with_no_drops() {
+        // The frame clock here is a manual clock, not the wall clock.
+        // This test asserts ordering and drop logic, and a wall clock
+        // on a loaded machine can deschedule the thread for more than
+        // one frame duration (33 ms at 30 fps), which used to fail
+        // this test intermittently under parallel load. The manual
+        // clock advances only when the player sleeps, so the test is
+        // deterministic under any load.
         let frames: Vec<Frame> = (0..5)
             .map(|i| solid_frame(4, 2, i * 33, 100 + i as u8, 128, 128))
             .collect();
         let sink = RecordingSink::new();
-        let mut player = VideoPlayer::new(sink, 30, 4, 2).unwrap();
+        let clock = ManualClock::new();
+        let mut player = VideoPlayer::with_clock(sink, 30, 4, 2, Box::new(clock)).unwrap();
         let report = player.play_frames(&frames).unwrap();
         assert_eq!(report.total, 5);
         assert_eq!(report.presented, 5);
@@ -1049,6 +1172,45 @@ mod tests {
         // The sink saw them in pts order.
         let pts: Vec<u64> = player.sink.presented.iter().map(|f| f.pts_ms()).collect();
         assert_eq!(pts, vec![0, 33, 66, 99, 132]);
+    }
+
+    #[test]
+    fn manual_clock_advances_only_when_sleeping() {
+        let clock = ManualClock::new();
+        assert_eq!(clock.now(), Duration::ZERO);
+        clock.sleep(Duration::from_millis(5));
+        assert_eq!(clock.now(), Duration::from_millis(5));
+        clock.sleep(Duration::from_millis(2));
+        assert_eq!(clock.now(), Duration::from_millis(7));
+        // Clones share the same virtual time.
+        let other = clock.clone();
+        other.sleep(Duration::from_millis(3));
+        assert_eq!(clock.now(), Duration::from_millis(10));
+    }
+
+    #[test]
+    fn manual_clock_playback_is_exact() {
+        // With a manual clock the whole playback runs in virtual time:
+        // no wall-clock waiting at all, so this also proves the
+        // player does not depend on real time for its ordering logic.
+        let frames: Vec<Frame> = (0..10)
+            .map(|i| solid_frame(4, 2, i * 100, 100, 128, 128))
+            .collect();
+        let mut player =
+            VideoPlayer::with_clock(RecordingSink::new(), 10, 4, 2, Box::new(ManualClock::new()))
+                .unwrap();
+        let report = player.play_frames(&frames).unwrap();
+        assert_eq!(report.presented, 10);
+        assert_eq!(report.dropped, 0);
+        assert_eq!(report.duration_ms, 900);
+    }
+
+    #[test]
+    fn encode_ppm_matches_the_ppm_header_and_data() {
+        let rgb = RgbFrame::new(2, 1, 0, vec![255, 0, 0, 0, 255, 0]).unwrap();
+        let bytes = encode_ppm(&rgb);
+        assert_eq!(&bytes[..11], b"P6\n2 1\n255\n");
+        assert_eq!(&bytes[11..], &[255, 0, 0, 0, 255, 0]);
     }
 
     #[test]
@@ -1072,12 +1234,16 @@ mod tests {
     #[test]
     fn player_drops_out_of_order_frames() {
         // pts 25 arrives after pts 50: it is older than what was shown.
+        // Runs on the manual clock: this test is about out-of-order
+        // logic, not wall-clock timing.
         let frames = vec![
             solid_frame(4, 2, 0, 100, 128, 128),
             solid_frame(4, 2, 50, 100, 128, 128),
             solid_frame(4, 2, 25, 100, 128, 128),
         ];
-        let mut player = VideoPlayer::new(RecordingSink::new(), 20, 4, 2).unwrap();
+        let mut player =
+            VideoPlayer::with_clock(RecordingSink::new(), 20, 4, 2, Box::new(ManualClock::new()))
+                .unwrap();
         let report = player.play_frames(&frames).unwrap();
         assert_eq!(report.presented, 2);
         assert_eq!(report.dropped, 1);
@@ -1087,10 +1253,17 @@ mod tests {
 
     #[test]
     fn player_pause_freezes_the_clock_and_resume_continues() {
+        // Runs on the manual clock: pause/resume logic is about the
+        // clock freezing, not about wall-clock scheduling — under load
+        // a real-clock run could drop a frame and fail the counts.
+        // The resume still comes from another thread after a real
+        // 100 ms sleep, so the elapsed-time assertion below is real.
         let frames: Vec<Frame> = (0..3)
             .map(|i| solid_frame(4, 2, i * 33, 100, 128, 128))
             .collect();
-        let mut player = VideoPlayer::new(RecordingSink::new(), 30, 4, 2).unwrap();
+        let mut player =
+            VideoPlayer::with_clock(RecordingSink::new(), 30, 4, 2, Box::new(ManualClock::new()))
+                .unwrap();
         let control = player.control();
         control.pause();
         let handle = std::thread::spawn(move || {
@@ -1136,7 +1309,13 @@ mod tests {
         let black = solid_frame(4, 2, 0, 16, 128, 128);
         let white = solid_frame(4, 2, 33, 235, 128, 128);
         let stream = encode_stream(&[black.clone(), white.clone()]);
-        let report = play_stream_to_dir(&stream, 30, &dir).unwrap();
+        // Drive the player on the manual clock: this test is about the
+        // PPM files, not wall-clock timing.
+        let frames = YuvDecoder::decode_all(&stream).unwrap();
+        let sink = PpmSink::new(&dir).unwrap();
+        let mut player =
+            VideoPlayer::with_clock(sink, 30, 4, 2, Box::new(ManualClock::new())).unwrap();
+        let report = player.play_frames(&frames).unwrap();
         assert_eq!(report.presented, 2);
         assert_eq!(report.dropped, 0);
         // Two files, in presentation order.
@@ -1157,7 +1336,12 @@ mod tests {
         let dir = test_dir("scaled");
         let frame = solid_frame(4, 4, 0, 76, 85, 255); // pure red
         let stream = encode_stream(&[frame]);
-        let report = play_stream_to_dir_scaled(&stream, 30, &dir, 2, 2).unwrap();
+        // Manual clock: this test is about scaling, not timing.
+        let frames = YuvDecoder::decode_all(&stream).unwrap();
+        let sink = PpmSink::new(&dir).unwrap();
+        let mut player =
+            VideoPlayer::with_clock(sink, 30, 2, 2, Box::new(ManualClock::new())).unwrap();
+        let report = player.play_frames(&frames).unwrap();
         assert_eq!(report.presented, 1);
         let (w, h, rgb) = read_ppm(&dir.join("frame_000000.ppm"));
         assert_eq!((w, h), (2, 2));

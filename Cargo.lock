@@ -200,6 +200,7 @@ dependencies = [
  "kernel-crypto",
  "kernel-identity",
  "kernel-storage",
+ "kernelodys",
 ]
 
 [[package]]
@@ -310,6 +311,7 @@ dependencies = [
 name = "kash-korner"
 version = "0.1.0"
 dependencies = [
+ "k-pay",
  "kernel-crypto",
  "kernel-identity",
  "x-koin",
@@ -322,6 +324,14 @@ dependencies = [
  "kernel-crypto",
  "kernel-identity",
  "kernel-storage",
+]
+
+[[package]]
+name = "kernel-authority"
+version = "0.1.0"
+dependencies = [
+ "kernel-crypto",
+ "kernel-identity",
 ]
 
 [[package]]
@@ -558,6 +568,7 @@ version = "0.1.0"
 dependencies = [
  "kernel-crypto",
  "kernel-identity",
+ "kernel-sim",
  "kernel-storage",
 ]
 

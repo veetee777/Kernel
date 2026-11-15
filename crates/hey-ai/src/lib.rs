@@ -1,36 +1,63 @@
-//! HEY•AI — voice on KERNEL.
+//! HEY•AI — the KERNEL-native personal AI assistant.
 //!
-//! Two pieces, both signed:
+//! Like Gemini is Google's AI, HEY•AI is KERNEL's AI: the assistant
+//! itself, living on KERNEL. The assistant core is
+//! [`assistant::Assistant`]: it takes a user message (text), routes
+//! it to the right app or tool with the fixed keyword router, runs
+//! the tool against caller-supplied local data, and answers in plain
+//! words — deterministically, from local data only. It keeps a
+//! conversation log (turns in order, with the tool each turn used
+//! and the local data each answer cites). There is no model here:
+//! routing is keywords, not understanding, and the assistant never
+//! reaches the network.
+//!
+//! Voice and rendering are things the assistant uses, not what it
+//! is. They live in the same crate because the assistant speaks
+//! through them:
 //!
 //! * A **voice note** is a signed manifest: a human name, a duration in
 //!   seconds, the chunked audio root CID, the owner, and the owner's
 //!   signature. Voice notes are stored exactly like photos and tracks —
 //!   chunked audio in the content store, manifest as a block, signature
 //!   plus per-chunk hash verification on read.
+//! * An **audio note** is a voice note whose chunks are real WAV audio:
+//!   its manifest (`KVOICE2`, see [`audio`]) also carries sample rate,
+//!   channels, and a language tag, and ingest refuses audio that is
+//!   not 16-bit PCM WAV, outside 8–48 kHz, or whose declared duration
+//!   does not match the audio. Playback renders the note to WAV bytes
+//!   through the Kernelodys engine (432 Hz retune); no audio device
+//!   is opened.
 //! * A **voice command** is a signed record: command text, the owner,
 //!   and the owner's signature. The text is parsed by a small fixed
 //!   router ([`parse_command`]) into a [`VoiceAction`]. The router is
 //!   deliberately tiny and total: unknown text maps to
-//!   [`VoiceAction::Unknown`], never a panic, never an error.
+//!   [`VoiceAction::Unknown`], never a panic, never an error. Actions
+//!   that need another crate's data run through [`dispatch`] with a
+//!   caller-supplied [`VoiceContext`].
 //!
-//! Nothing here records audio, transcribes speech, or plays sound.
-//! This crate stores signed voice notes and routes command text to
-//! actions. Recording, transcription, and playback are separate
-//! concerns.
+//! Nothing here records audio or transcribes speech. Recording and
+//! transcription are separate concerns.
 //!
-//! The same crate also holds HEY•AI's **render engine**: a small
-//! deterministic template language (`{{name}}`, `{{#each}}`,
-//! `{{#if}}`) over plain data values — no JSON, no code execution.
-//! Rendering is pure data transformation: the same template plus
-//! the same data always produces the exact same bytes, addressed
-//! by their SHA-256. A [`RenderQueue`] runs jobs in order and
-//! records each result; a failed job never blocks the next one.
+//! The same crate also holds the **render engine**, a tool the
+//! assistant uses: a small deterministic template language
+//! (`{{name}}`, `{{#each}}`, `{{#if}}`) over plain data values — no
+//! JSON, no code execution. Rendering is pure data transformation:
+//! the same template plus the same data always produces the exact
+//! same bytes, addressed by their SHA-256. A [`RenderQueue`] runs
+//! jobs in order and records each result; a failed job never blocks
+//! the next one.
 //!
 //! Formats (explicit binary, no JSON):
-//! `KVOICE1` + name length (u16 LE) + name bytes + duration (u64 LE) +
+//! ```text
+//! KVOICE1 + name length (u16 LE) + name bytes + duration (u64 LE) +
 //! chunk root CID (32) + owner public key (32) + signature (64).
-//! `KCMDVC1` + text length (u32 LE) + text bytes + owner public key
+//! KVOICE2 + name length (u16 LE) + name bytes + duration (u64 LE) +
+//! sample rate (u32 LE) + channels (u16 LE) + language length (u16 LE)
+//! + language bytes + chunk root CID (32) + owner public key (32) +
+//! signature (64).
+//! KCMDVC1 + text length (u32 LE) + text bytes + owner public key
 //! (32) + signature (64).
+//! ```
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -38,6 +65,22 @@ use std::fmt;
 use kernel_crypto::Ed25519Signature;
 use kernel_identity::{Identity, IdentityError, PeerId};
 use kernel_storage::{Cid, ContentStore, StorageError};
+
+/// Real voice-note audio: WAV validation, audio-note manifests, and
+/// playback through the Kernelodys engine. See [`audio`] for the
+/// supported formats and the duration rule.
+mod audio;
+
+/// The assistant core: the KERNEL-native personal AI assistant.
+/// See [`assistant`] for what it is and what it does.
+mod assistant;
+
+pub use assistant::{Assistant, AssistantTurn, Citation, ToolUsed, REFUSAL};
+
+pub use audio::{
+    check_duration_match, play_wav_bytes, validate_language, validate_wav, AudioNoteManifest,
+    AudioNoteMetadata, WavInfo, MAX_LANGUAGE_LEN, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE,
+};
 
 /// Magic bytes at the start of every voice note manifest.
 const NOTE_MAGIC: &[u8; 7] = b"KVOICE1";
@@ -72,6 +115,12 @@ pub enum VoiceError {
     InvalidManifest(String),
     /// A manifest's or command's signature did not verify.
     BadSignature,
+    /// WAV audio failed validation: not a WAV file, an unsupported
+    /// format, a sample rate outside 8–48 kHz, or a declared
+    /// duration that does not match the audio.
+    InvalidAudio(String),
+    /// Playback through the Kernelodys engine failed.
+    Playback(String),
     /// No voice note or command with this CID is known here.
     NotFound(Cid),
 }
@@ -86,6 +135,8 @@ impl fmt::Display for VoiceError {
             VoiceError::InvalidCommand(msg) => write!(f, "invalid command: {msg}"),
             VoiceError::InvalidManifest(msg) => write!(f, "invalid manifest: {msg}"),
             VoiceError::BadSignature => write!(f, "signature is invalid"),
+            VoiceError::InvalidAudio(msg) => write!(f, "invalid audio: {msg}"),
+            VoiceError::Playback(msg) => write!(f, "playback failed: {msg}"),
             VoiceError::NotFound(cid) => write!(f, "voice note not found: {cid}"),
         }
     }
@@ -206,6 +257,18 @@ pub enum VoiceAction {
     Previous,
     /// List the available tracks.
     ListTracks,
+    /// Search the content store for blocks containing these words.
+    Search {
+        /// The words to search for, as spoken.
+        query: String,
+    },
+    /// Show a creator bundle by id.
+    ShowBundle {
+        /// The bundle id, as spoken.
+        bundle_id: String,
+    },
+    /// List the caller's orders.
+    ListOrders,
     /// The text did not match any known command.
     Unknown,
 }
@@ -219,6 +282,9 @@ pub enum VoiceAction {
 /// Recognized forms (leading/trailing whitespace ignored):
 /// * `play <name>` — [`VoiceAction::Play`] with the name trimmed.
 /// * `pause`, `next`, `previous` or `prev`, `list`.
+/// * `search <words>` — [`VoiceAction::Search`] with the words trimmed.
+/// * `bundle <id>` — [`VoiceAction::ShowBundle`] with the id trimmed.
+/// * `orders` — [`VoiceAction::ListOrders`].
 pub fn parse_command(text: &str) -> VoiceAction {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -236,12 +302,171 @@ pub fn parse_command(text: &str) -> VoiceAction {
             track_name: name.to_string(),
         };
     }
+    // "search " and "bundle " are both 7 bytes.
+    if lower.starts_with("search ") {
+        let query = trimmed[7..].trim();
+        if query.is_empty() {
+            return VoiceAction::Unknown;
+        }
+        return VoiceAction::Search {
+            query: query.to_string(),
+        };
+    }
+    if lower.starts_with("bundle ") {
+        let id = trimmed[7..].trim();
+        if id.is_empty() {
+            return VoiceAction::Unknown;
+        }
+        return VoiceAction::ShowBundle {
+            bundle_id: id.to_string(),
+        };
+    }
     match lower.as_str() {
         "pause" => VoiceAction::Pause,
         "next" => VoiceAction::Next,
         "previous" | "prev" => VoiceAction::Previous,
         "list" => VoiceAction::ListTracks,
+        "orders" => VoiceAction::ListOrders,
         _ => VoiceAction::Unknown,
+    }
+}
+
+/// Maximum search results returned for one query.
+pub const MAX_SEARCH_HITS: usize = 20;
+/// Characters of a matching block shown in a search excerpt.
+pub const SEARCH_EXCERPT_CHARS: usize = 80;
+
+/// Search a content store for blocks whose UTF-8 text contains
+/// `query` (case-insensitive). Returns up to [`MAX_SEARCH_HITS`]
+/// (CID, excerpt) pairs, sorted by CID for determinism.
+/// Non-UTF-8 blocks never match. An empty query matches nothing.
+pub fn search_blocks(store: &ContentStore, query: &str) -> Vec<(Cid, String)> {
+    let needle = query.to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut hits: Vec<(Cid, String)> = Vec::new();
+    for (cid, bytes) in store.blocks() {
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        if text.to_lowercase().contains(&needle) {
+            let excerpt: String = text.chars().take(SEARCH_EXCERPT_CHARS).collect();
+            hits.push((cid, excerpt));
+        }
+    }
+    hits.sort_by_key(|(cid, _)| cid.to_hex());
+    hits.truncate(MAX_SEARCH_HITS);
+    hits
+}
+
+/// Data a voice command can act on, supplied by the caller. Nothing
+/// here is a hidden global: a command that needs another crate's
+/// data gets it through this struct. Any field may be left empty;
+/// an action that needs data that was not supplied reports the
+/// empty result (no matches, no tracks, no orders) rather than
+/// failing.
+#[derive(Clone, Default)]
+pub struct VoiceContext<'a> {
+    /// Content store to search, when the caller provides one.
+    pub store: Option<&'a ContentStore>,
+    /// Track names the caller knows about (e.g. from Kernelodys).
+    pub tracks: &'a [String],
+    /// Bundle ids the caller knows about (e.g. from K•AI).
+    pub bundles: &'a [String],
+    /// The caller's order summaries (e.g. from K•Pay).
+    pub orders: &'a [String],
+}
+
+/// What running a voice command against a [`VoiceContext`] produced.
+/// A result, never a panic and never an error: a command that
+/// cannot be satisfied says so in its outcome.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VoiceOutcome {
+    /// The named track was found (the canonical name from the
+    /// caller's track list, which may differ in case from what was
+    /// spoken).
+    Playing {
+        /// The track name from the caller's list.
+        track_name: String,
+    },
+    /// No track in the caller's list matches the spoken name.
+    TrackNotFound {
+        /// The name as spoken.
+        track_name: String,
+    },
+    /// Pause playback.
+    Paused,
+    /// Skip to the next track.
+    NextTrack,
+    /// Go back to the previous track.
+    PreviousTrack,
+    /// The caller's track list.
+    TrackList(Vec<String>),
+    /// Search results: (block CID, excerpt) pairs.
+    SearchResults(Vec<(Cid, String)>),
+    /// A bundle with this id is known to the caller.
+    BundleFound {
+        /// The bundle id, as spoken.
+        bundle_id: String,
+    },
+    /// No bundle with this id is known to the caller.
+    BundleNotFound {
+        /// The bundle id, as spoken.
+        bundle_id: String,
+    },
+    /// The caller's orders.
+    Orders(Vec<String>),
+    /// The command did not match any known intent.
+    Unknown,
+}
+
+/// Run a parsed action against caller-supplied data. The router is
+/// fixed keyword intents, not understanding: `play` resolves a
+/// track name against the caller's track list (case-insensitive),
+/// `search` scans the supplied store, `bundle` checks the caller's
+/// bundle ids, `orders` returns the caller's order summaries, and
+/// anything else reports itself as not found or unknown.
+pub fn dispatch(action: &VoiceAction, ctx: &VoiceContext) -> VoiceOutcome {
+    match action {
+        VoiceAction::Play { track_name } => {
+            match ctx
+                .tracks
+                .iter()
+                .find(|t| t.eq_ignore_ascii_case(track_name))
+            {
+                Some(canonical) => VoiceOutcome::Playing {
+                    track_name: canonical.clone(),
+                },
+                None => VoiceOutcome::TrackNotFound {
+                    track_name: track_name.clone(),
+                },
+            }
+        }
+        VoiceAction::Pause => VoiceOutcome::Paused,
+        VoiceAction::Next => VoiceOutcome::NextTrack,
+        VoiceAction::Previous => VoiceOutcome::PreviousTrack,
+        VoiceAction::ListTracks => VoiceOutcome::TrackList(ctx.tracks.to_vec()),
+        VoiceAction::Search { query } => {
+            let results = match ctx.store {
+                Some(store) => search_blocks(store, query),
+                None => Vec::new(),
+            };
+            VoiceOutcome::SearchResults(results)
+        }
+        VoiceAction::ShowBundle { bundle_id } => {
+            if ctx.bundles.iter().any(|b| b == bundle_id) {
+                VoiceOutcome::BundleFound {
+                    bundle_id: bundle_id.clone(),
+                }
+            } else {
+                VoiceOutcome::BundleNotFound {
+                    bundle_id: bundle_id.clone(),
+                }
+            }
+        }
+        VoiceAction::ListOrders => VoiceOutcome::Orders(ctx.orders.to_vec()),
+        VoiceAction::Unknown => VoiceOutcome::Unknown,
     }
 }
 
@@ -388,6 +613,12 @@ impl VoiceCommand {
         parse_command(&self.text)
     }
 
+    /// Run this command's action against caller-supplied data.
+    /// See [`dispatch`] for what each action does.
+    pub fn dispatch(&self, ctx: &VoiceContext) -> VoiceOutcome {
+        dispatch(&self.action(), ctx)
+    }
+
     /// Encode to the explicit binary command format.
     pub fn encode(&self) -> Vec<u8> {
         let text_bytes = self.text.as_bytes();
@@ -451,6 +682,16 @@ pub struct VoiceNoteMetadata {
     pub duration_secs: u64,
     /// Who owns (recorded) this voice note.
     pub owner: PeerId,
+    /// Sample rate in Hz, when the note is a validated WAV audio
+    /// note ([`AudioNoteMetadata`]). `None` for legacy notes stored
+    /// as opaque bytes.
+    pub sample_rate: Option<u32>,
+    /// Channel count (1 mono, 2 stereo), when the note is a
+    /// validated WAV audio note. `None` for legacy notes.
+    pub channels: Option<u16>,
+    /// Language tag (e.g. `en`), when the note is a validated WAV
+    /// audio note. `None` for legacy notes.
+    pub language: Option<String>,
 }
 
 /// A voice store: a content store plus indexes of voice note manifests
@@ -462,6 +703,8 @@ pub struct VoiceStore {
     notes: HashMap<Cid, VoiceNoteManifest>,
     /// Voice command records this node holds, by record CID.
     commands: HashMap<Cid, VoiceCommand>,
+    /// Audio note manifests this node holds, by manifest CID.
+    audio_notes: HashMap<Cid, AudioNoteManifest>,
 }
 
 impl Default for VoiceStore {
@@ -478,6 +721,7 @@ impl VoiceStore {
             store: ContentStore::new(),
             notes: HashMap::new(),
             commands: HashMap::new(),
+            audio_notes: HashMap::new(),
         }
     }
 
@@ -543,8 +787,121 @@ impl VoiceStore {
             name: manifest.name,
             owner: manifest.owner,
             duration_secs: manifest.duration_secs,
+            sample_rate: None,
+            channels: None,
+            language: None,
         };
         Ok((data, metadata))
+    }
+
+    /// The audio note manifest for a voice note, if this node holds it.
+    pub fn get_audio_manifest(&self, manifest_cid: &Cid) -> Option<&AudioNoteManifest> {
+        self.audio_notes.get(manifest_cid)
+    }
+
+    /// Store a voice note as real WAV audio: validate the bytes
+    /// (16-bit PCM, mono/stereo, 8–48 kHz), check the declared
+    /// duration against the audio, then chunk the bytes, build and
+    /// sign the audio manifest, and store the manifest as a block.
+    /// Returns the manifest CID — the note's address.
+    pub fn put_audio_note(
+        &mut self,
+        name: &str,
+        duration_secs: u64,
+        wav_bytes: &[u8],
+        language: &str,
+        identity: &Identity,
+    ) -> Result<Cid, VoiceError> {
+        validate_name(name)?;
+        validate_duration(duration_secs)?;
+        let info = validate_wav(wav_bytes)?;
+        check_duration_match(duration_secs, &info)?;
+        let root = self.store.put_chunked(wav_bytes);
+        let manifest = AudioNoteManifest::new(
+            name,
+            duration_secs,
+            info.sample_rate,
+            info.channels,
+            language,
+            root,
+            identity,
+        )?;
+        let manifest_cid = self.store.put(&manifest.encode());
+        self.audio_notes.insert(manifest_cid, manifest);
+        Ok(manifest_cid)
+    }
+
+    /// Fetch an audio note by manifest CID: verify the manifest
+    /// signature, reassemble the chunked WAV (every chunk
+    /// hash-verified), then validate the audio again — sample rate,
+    /// channels, and declared duration against the manifest. Returns
+    /// the WAV bytes and metadata.
+    pub fn get_audio_note(
+        &self,
+        manifest_cid: &Cid,
+    ) -> Result<(Vec<u8>, AudioNoteMetadata), VoiceError> {
+        let manifest = match self.audio_notes.get(manifest_cid) {
+            Some(m) => m.clone(),
+            None => {
+                let bytes = self.store.get(manifest_cid).map_err(|e| match e {
+                    StorageError::NotFound(cid) => VoiceError::NotFound(cid),
+                    other => VoiceError::Storage(other),
+                })?;
+                AudioNoteManifest::decode(&bytes)?
+            }
+        };
+        if !manifest.verify() {
+            return Err(VoiceError::BadSignature);
+        }
+        let data = self
+            .store
+            .get_chunked(&manifest.root)
+            .map_err(VoiceError::Storage)?;
+        let info = validate_wav(&data)?;
+        if info.sample_rate != manifest.sample_rate || info.channels != manifest.channels {
+            return Err(VoiceError::InvalidAudio(format!(
+                "manifest claims {} Hz {}-channel audio but the bytes are {} Hz {}-channel",
+                manifest.sample_rate, manifest.channels, info.sample_rate, info.channels
+            )));
+        }
+        check_duration_match(manifest.duration_secs, &info)?;
+        let metadata = AudioNoteMetadata {
+            name: manifest.name,
+            duration_secs: manifest.duration_secs,
+            sample_rate: manifest.sample_rate,
+            channels: manifest.channels,
+            language: manifest.language,
+            owner: manifest.owner,
+        };
+        Ok((data, metadata))
+    }
+
+    /// Play an audio note through the Kernelodys engine and return
+    /// the rendered WAV bytes. The output is the engine's 432 Hz
+    /// retune of the note at the same sample rate and channel count;
+    /// the stored bytes are untouched. Playback is offline — no
+    /// real-time pacing, no audio device.
+    pub fn play_voice_note(&self, manifest_cid: &Cid) -> Result<Vec<u8>, VoiceError> {
+        let (wav, _) = self.get_audio_note(manifest_cid)?;
+        play_wav_bytes(&wav)
+    }
+
+    /// All audio notes held, as (manifest CID, name), sorted by name
+    /// for a stable, human-readable listing.
+    pub fn list_audio_notes(&self) -> Vec<(Cid, String)> {
+        let mut out: Vec<(Cid, String)> = self
+            .audio_notes
+            .iter()
+            .map(|(cid, m)| (*cid, m.name.clone()))
+            .collect();
+        out.sort_by(|a, b| a.1.cmp(&b.1));
+        out
+    }
+
+    /// Search this store's blocks for text, for the `search` voice
+    /// command. See [`search_blocks`].
+    pub fn search(&self, query: &str) -> Vec<(Cid, String)> {
+        search_blocks(&self.store, query)
     }
 
     /// All voice notes held, as (manifest CID, name), sorted by name
@@ -1597,5 +1954,370 @@ mod tests {
         assert_eq!(queue.result(id2).unwrap().status, JobStatus::Pending);
         assert_eq!(queue.run_next(), Some(id2));
         assert_eq!(queue.run_next(), None);
+    }
+
+    // --- Audio notes, WAV validation, playback ---
+
+    /// Build a minimal 16-bit PCM WAV in memory.
+    fn build_wav(channels: u16, sample_rate: u32, samples: &[i16]) -> Vec<u8> {
+        let block_align = channels * 2;
+        let byte_rate = sample_rate * block_align as u32;
+        let mut fmt = Vec::with_capacity(16);
+        fmt.extend_from_slice(&1u16.to_le_bytes());
+        fmt.extend_from_slice(&channels.to_le_bytes());
+        fmt.extend_from_slice(&sample_rate.to_le_bytes());
+        fmt.extend_from_slice(&byte_rate.to_le_bytes());
+        fmt.extend_from_slice(&block_align.to_le_bytes());
+        fmt.extend_from_slice(&16u16.to_le_bytes());
+        let mut data = Vec::with_capacity(samples.len() * 2);
+        for &s in samples {
+            data.extend_from_slice(&s.to_le_bytes());
+        }
+        let mut chunks = Vec::new();
+        let push_chunk = |id: &[u8; 4], payload: &[u8], chunks: &mut Vec<u8>| {
+            chunks.extend_from_slice(id);
+            chunks.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            chunks.extend_from_slice(payload);
+            if payload.len() % 2 == 1 {
+                chunks.push(0);
+            }
+        };
+        push_chunk(b"fmt ", &fmt, &mut chunks);
+        push_chunk(b"data", &data, &mut chunks);
+        let mut out = Vec::with_capacity(12 + chunks.len());
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&((4 + chunks.len()) as u32).to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+        out.extend_from_slice(&chunks);
+        out
+    }
+
+    fn sine_i16(freq_hz: f64, sample_rate: u32, secs: f64) -> Vec<i16> {
+        let n = (sample_rate as f64 * secs) as usize;
+        (0..n)
+            .map(|i| {
+                (20000.0
+                    * (2.0 * std::f64::consts::PI * freq_hz * i as f64 / sample_rate as f64).sin())
+                    as i16
+            })
+            .collect()
+    }
+
+    #[test]
+    fn audio_note_round_trip() {
+        let alice = Identity::generate("alice").unwrap();
+        let mut voice = VoiceStore::new();
+        let wav = build_wav(1, 8000, &sine_i16(440.0, 8000, 2.0));
+        let cid = voice
+            .put_audio_note("morning memo", 2, &wav, "en", &alice)
+            .unwrap();
+        let (bytes, meta) = voice.get_audio_note(&cid).unwrap();
+        assert_eq!(bytes, wav);
+        assert_eq!(meta.name, "morning memo");
+        assert_eq!(meta.duration_secs, 2);
+        assert_eq!(meta.sample_rate, 8000);
+        assert_eq!(meta.channels, 1);
+        assert_eq!(meta.language, "en");
+        assert_eq!(meta.owner, *alice.peer_id());
+        assert_eq!(
+            voice.list_audio_notes(),
+            vec![(cid, "morning memo".to_string())]
+        );
+        // A legacy note carries no audio metadata.
+        let legacy = voice.put_voice_note("old", 5, b"opaque", &alice).unwrap();
+        let (_, legacy_meta) = voice.get_voice_note(&legacy).unwrap();
+        assert_eq!(legacy_meta.sample_rate, None);
+        assert_eq!(legacy_meta.channels, None);
+        assert_eq!(legacy_meta.language, None);
+    }
+
+    #[test]
+    fn audio_note_duration_mismatch_refused() {
+        let alice = Identity::generate("alice").unwrap();
+        let mut voice = VoiceStore::new();
+        let two_sec = build_wav(1, 8000, &sine_i16(440.0, 8000, 2.0));
+        // Declared 3 s for 2 s of audio.
+        assert!(matches!(
+            voice.put_audio_note("memo", 3, &two_sec, "en", &alice),
+            Err(VoiceError::InvalidDuration(_))
+        ));
+        // Declared 1 s for 2 s of audio.
+        assert!(matches!(
+            voice.put_audio_note("memo", 1, &two_sec, "en", &alice),
+            Err(VoiceError::InvalidDuration(_))
+        ));
+        // 1.5 s of audio rounds to 2: declared 2 works, declared 1 fails.
+        let half = build_wav(1, 8000, &sine_i16(440.0, 8000, 1.5));
+        assert!(matches!(
+            voice.put_audio_note("memo", 1, &half, "en", &alice),
+            Err(VoiceError::InvalidDuration(_))
+        ));
+        assert!(voice.put_audio_note("memo", 2, &half, "en", &alice).is_ok());
+        // Non-WAV bytes and bad language are refused too.
+        assert!(matches!(
+            voice.put_audio_note("memo", 2, b"not audio", "en", &alice),
+            Err(VoiceError::InvalidAudio(_))
+        ));
+        assert!(matches!(
+            voice.put_audio_note("memo", 2, &two_sec, "", &alice),
+            Err(VoiceError::InvalidAudio(_))
+        ));
+    }
+
+    #[test]
+    fn audio_note_tampered_manifest_refused() {
+        let alice = Identity::generate("alice").unwrap();
+        let mut voice = VoiceStore::new();
+        let wav = build_wav(1, 8000, &sine_i16(440.0, 8000, 1.0));
+        let cid = voice.put_audio_note("memo", 1, &wav, "en", &alice).unwrap();
+        let mut bytes = voice.store_mut().get(&cid).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        let tampered_cid = voice.store_mut().put(&bytes);
+        assert_eq!(
+            voice.get_audio_note(&tampered_cid),
+            Err(VoiceError::BadSignature)
+        );
+        assert!(voice.get_audio_note(&cid).is_ok());
+    }
+
+    #[test]
+    fn audio_note_wrong_duration_refused_on_read() {
+        let alice = Identity::generate("alice").unwrap();
+        let mut voice = VoiceStore::new();
+        // 1 s of audio, but a manifest honestly signed for 5 s: the
+        // ingest path would refuse it, so hand-craft it straight
+        // into the store and check the read path refuses it.
+        let wav = build_wav(1, 8000, &sine_i16(440.0, 8000, 1.0));
+        let root = voice.store_mut().put_chunked(&wav);
+        let manifest = AudioNoteManifest::new("memo", 5, 8000, 1, "en", root, &alice).unwrap();
+        let cid = voice.store_mut().put(&manifest.encode());
+        assert!(matches!(
+            voice.get_audio_note(&cid),
+            Err(VoiceError::InvalidDuration(_))
+        ));
+    }
+
+    #[test]
+    fn play_voice_note_renders_the_retune() {
+        let alice = Identity::generate("alice").unwrap();
+        let mut voice = VoiceStore::new();
+        let sample_rate = 44_100u32;
+        let wav = build_wav(1, sample_rate, &sine_i16(440.0, sample_rate, 1.0));
+        let cid = voice.put_audio_note("memo", 1, &wav, "en", &alice).unwrap();
+        let played = voice.play_voice_note(&cid).unwrap();
+        let audio = kernelodys::wav::decode_wav(&played).unwrap();
+        assert_eq!(audio.sample_rate, sample_rate);
+        assert_eq!(audio.channels, 1);
+        // Same audio as the direct retune, retune aside.
+        let direct = kernelodys::wav::play_wav_432(&wav).unwrap().retuned.samples;
+        assert_eq!(audio.samples, direct);
+        // Playing an unknown note is a clean not-found.
+        let missing = Cid::from_bytes(kernel_crypto::sha256(b"no such note"));
+        assert_eq!(
+            voice.play_voice_note(&missing),
+            Err(VoiceError::NotFound(missing))
+        );
+    }
+
+    // --- New voice command intents ---
+
+    #[test]
+    fn parse_command_new_intents() {
+        assert_eq!(
+            parse_command("search kernel storage"),
+            VoiceAction::Search {
+                query: "kernel storage".to_string()
+            }
+        );
+        assert_eq!(
+            parse_command("SEARCH Kernel"),
+            VoiceAction::Search {
+                query: "Kernel".to_string()
+            }
+        );
+        assert_eq!(
+            parse_command("  search   spaced out  "),
+            VoiceAction::Search {
+                query: "spaced out".to_string()
+            }
+        );
+        assert_eq!(parse_command("search"), VoiceAction::Unknown);
+        assert_eq!(parse_command("search   "), VoiceAction::Unknown);
+        assert_eq!(parse_command("searching for things"), VoiceAction::Unknown);
+        assert_eq!(
+            parse_command("bundle my-first-bundle"),
+            VoiceAction::ShowBundle {
+                bundle_id: "my-first-bundle".to_string()
+            }
+        );
+        assert_eq!(
+            parse_command("BUNDLE Bundle-42"),
+            VoiceAction::ShowBundle {
+                bundle_id: "Bundle-42".to_string()
+            }
+        );
+        assert_eq!(parse_command("bundle"), VoiceAction::Unknown);
+        assert_eq!(parse_command("bundle   "), VoiceAction::Unknown);
+        assert_eq!(parse_command("orders"), VoiceAction::ListOrders);
+        assert_eq!(parse_command("ORDERS"), VoiceAction::ListOrders);
+        assert_eq!(parse_command("orders please"), VoiceAction::Unknown);
+        // The old intents are unchanged.
+        assert_eq!(
+            parse_command("play Midnight"),
+            VoiceAction::Play {
+                track_name: "Midnight".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn dispatch_executes_intents() {
+        let mut store = ContentStore::new();
+        let hit = store.put(b"the kernel storage notes are here");
+        let _other = store.put(b"nothing relevant");
+        let _binary = store.put(&[0xff, 0xfe, 0x00, 0x01]);
+        let tracks = vec!["Midnight".to_string(), "Dawn".to_string()];
+        let bundles = vec!["my-first-bundle".to_string()];
+        let orders = vec!["order-1: lamp, paid".to_string()];
+        let ctx = VoiceContext {
+            store: Some(&store),
+            tracks: &tracks,
+            bundles: &bundles,
+            orders: &orders,
+        };
+        // Search is case-insensitive and returns the matching block.
+        assert_eq!(
+            dispatch(
+                &VoiceAction::Search {
+                    query: "KERNEL".to_string()
+                },
+                &ctx
+            ),
+            VoiceOutcome::SearchResults(vec![(
+                hit,
+                "the kernel storage notes are here".to_string()
+            )])
+        );
+        assert_eq!(
+            dispatch(
+                &VoiceAction::Search {
+                    query: "nothing here".to_string()
+                },
+                &ctx
+            ),
+            VoiceOutcome::SearchResults(vec![])
+        );
+        // Play resolves case-insensitively to the canonical name.
+        assert_eq!(
+            dispatch(
+                &VoiceAction::Play {
+                    track_name: "midnight".to_string()
+                },
+                &ctx
+            ),
+            VoiceOutcome::Playing {
+                track_name: "Midnight".to_string()
+            }
+        );
+        assert_eq!(
+            dispatch(
+                &VoiceAction::Play {
+                    track_name: "Nope".to_string()
+                },
+                &ctx
+            ),
+            VoiceOutcome::TrackNotFound {
+                track_name: "Nope".to_string()
+            }
+        );
+        // Bundle found / not found.
+        assert_eq!(
+            dispatch(
+                &VoiceAction::ShowBundle {
+                    bundle_id: "my-first-bundle".to_string()
+                },
+                &ctx
+            ),
+            VoiceOutcome::BundleFound {
+                bundle_id: "my-first-bundle".to_string()
+            }
+        );
+        assert_eq!(
+            dispatch(
+                &VoiceAction::ShowBundle {
+                    bundle_id: "other".to_string()
+                },
+                &ctx
+            ),
+            VoiceOutcome::BundleNotFound {
+                bundle_id: "other".to_string()
+            }
+        );
+        // Orders and list.
+        assert_eq!(
+            dispatch(&VoiceAction::ListOrders, &ctx),
+            VoiceOutcome::Orders(orders.clone())
+        );
+        assert_eq!(
+            dispatch(&VoiceAction::ListTracks, &ctx),
+            VoiceOutcome::TrackList(tracks.clone())
+        );
+        assert_eq!(dispatch(&VoiceAction::Pause, &ctx), VoiceOutcome::Paused);
+        assert_eq!(dispatch(&VoiceAction::Next, &ctx), VoiceOutcome::NextTrack);
+        assert_eq!(
+            dispatch(&VoiceAction::Previous, &ctx),
+            VoiceOutcome::PreviousTrack
+        );
+        assert_eq!(dispatch(&VoiceAction::Unknown, &ctx), VoiceOutcome::Unknown);
+        // No store supplied: search finds nothing, the rest still works.
+        let bare = VoiceContext::default();
+        assert_eq!(
+            dispatch(
+                &VoiceAction::Search {
+                    query: "kernel".to_string()
+                },
+                &bare
+            ),
+            VoiceOutcome::SearchResults(vec![])
+        );
+        assert_eq!(
+            dispatch(&VoiceAction::ListOrders, &bare),
+            VoiceOutcome::Orders(vec![])
+        );
+        // A signed command dispatches the same way.
+        let alice = Identity::generate("alice").unwrap();
+        let command = VoiceCommand::new("search kernel", &alice).unwrap();
+        assert_eq!(
+            command.dispatch(&ctx),
+            VoiceOutcome::SearchResults(vec![(
+                hit,
+                "the kernel storage notes are here".to_string()
+            )])
+        );
+    }
+
+    #[test]
+    fn search_blocks_caps_and_excerpts() {
+        let mut store = ContentStore::new();
+        for i in 0..25 {
+            store.put(format!("kernel note number {i}").as_bytes());
+        }
+        let hits = search_blocks(&store, "kernel");
+        assert_eq!(hits.len(), MAX_SEARCH_HITS);
+        // Sorted by CID, so deterministic.
+        let cids: Vec<String> = hits.iter().map(|(c, _)| c.to_hex()).collect();
+        let mut sorted = cids.clone();
+        sorted.sort();
+        assert_eq!(cids, sorted);
+        // Long text is excerpted at 80 chars.
+        let mut long_store = ContentStore::new();
+        let long_text = format!("kernel {}", "x".repeat(200));
+        long_store.put(long_text.as_bytes());
+        let hits = search_blocks(&long_store, "kernel");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].1.chars().count(), SEARCH_EXCERPT_CHARS);
+        // Empty query matches nothing.
+        assert_eq!(search_blocks(&store, ""), Vec::new());
     }
 }
