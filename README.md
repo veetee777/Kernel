@@ -12,7 +12,7 @@ that code is still locked behind that account's paywall.
 
 A Cargo workspace (`resolver = "2"`) with thirty-eight crates. All compile
 with no warnings, and all tests pass (`cargo test` from this directory:
-652 tests, 0 failed).
+730 tests, 0 failed).
 
 **Foundation**
 - **`kernel-crypto`** — Ed25519 signing, X25519 key exchange,
@@ -134,6 +134,11 @@ with no warnings, and all tests pass (`cargo test` from this directory:
   number (orders a sender's messages across connections), and the
   sender's signature. Bad signatures and wrong-recipient messages are
   rejected before storage; signatures are verified again on read.
+  Groups (signed records, creator-only membership, group messages
+  for members only), persistent binary history (`KTHIST1`, save/load,
+  corruption refused), signed delivery receipts, and an offline
+  outbox (capped per peer, delivered in order on reconnect, cleared
+  only on ack).
 - **`k-photos` (K•Photos)** — Named, signed photos on chunked
   storage. A photo is a `KPHOTO1` manifest (name, chunk root, owner,
   signature, plus width, height, format, taken timestamp) stored as a
@@ -168,6 +173,11 @@ with no warnings, and all tests pass (`cargo test` from this directory:
   and tampered hashes each fail with a distinct error), fork choice
   is longest valid chain wins (ties go to the first chain). Blocks
   are stored as blocks in the content store and retrievable by CID.
+  Proof-of-work mining (nonce + configurable difficulty target),
+  a mempool (dedupe, cap, oldest-evicted-first), full block
+  validation, fork reorgs that return orphaned transactions to the
+  mempool, and binary `KCHAIN1` persistence (save/load, corrupted
+  saves refused). Single-node chain — no network consensus.
 
 **Payments (new)**
 - **`x-koin` (X•Koin)** — The coin: an account-based ledger on
@@ -183,12 +193,19 @@ with no warnings, and all tests pass (`cargo test` from this directory:
   transaction and returning a receipt signed by the payer, which
   anyone can verify without seeing the ledger. Paying an expired
   invoice or paying twice is rejected; insufficient funds are
-  refused by the ledger and nothing moves.
+  refused by the ledger and nothing moves. Recurring subscriptions
+  (pre-signed occurrences, `tick(now)` executes what is due, failed
+  occurrences are consumed not retried), one-time refunds, and
+  payment history by payer/payee.
 - **`kernel-xchange` (Kernel•XChange)** — A signed order book.
   Orders (human-readable id, owner, buy/sell, price, amount,
   owner signature) match when buy price >= sell price, executing
   at the sell price, with partial fills and deterministic
   price-then-time priority. Only the owner can cancel an order.
+  Market orders (best available price, `NoLiquidity` when the book
+  is empty), atomic settlement through the x-koin ledger via a
+  caller-supplied signer (a failed settlement changes nothing),
+  and trade history with `last_price()` and `volume()`.
 - **`kash-korner` (Kash•Korner)** — A simple signed store /
   marketplace settled on X•Koin. A listing (human-readable id,
   seller, item name, description, price, seller signature) is
@@ -229,6 +246,14 @@ with no warnings, and all tests pass (`cargo test` from this directory:
   Ships one provider, `TestProvider`, a local deterministic test
   provider that returns the prompt uppercased with a `KAI-TEST:`
   prefix. It is clearly labeled a test provider, not intelligence.
+  The `LocalAgent` provider is the real one: deterministic keyword
+  routing to tools that do actual work — storage search, bundle
+  assembly, HEY•AI rendering, bundle purchase — and answers from
+  tool outputs only. Kai is for **creator bundles**, not scripture.
+  A bundle is a signed `KBNDL1` manifest (creator, id, title,
+  description, items with content CIDs, price in X•Koin); Kai
+  assembles it (every CID verified), renders its page, and sells it
+  through K•Pay. One tool per task, every call on the audit trail.
 - **`hey-ai` (HEY•AI)** — Voice. A voice note is a signed `KVOICE1`
   manifest (name, duration, chunk root, owner, signature) on chunked
   storage. A voice command is a signed `KCMDVC1` record (text, owner,
@@ -247,7 +272,11 @@ with no warnings, and all tests pass (`cargo test` from this directory:
   signature); a follow is a signed `KFOL1` record (follower,
   followed, signature). `feed` returns posts from followed peers,
   newest first, verifying each post's signature on read. Following
-  yourself is refused; following is idempotent.
+  yourself is refused; following is idempotent. Comments (`KCOM1`),
+  likes (`KLIKE1`, idempotent), reposts (`KRPT1`, always marked as
+  reposts, chains resolve to the original), media metadata (kind +
+  size, 64 MiB cap, signed with the post), and blocking (`KBLK1`,
+  local — a blocked author's content never appears to the blocker).
 - **`x-koms` (X•Kom's)** — The owner's personal tool. A note is a
   signed `KNOTE1` manifest (title, chunked body, owner, signature).
   A task is a signed `XKTASK1` record (id, title, done flag, owner,

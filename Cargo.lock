@@ -233,9 +233,12 @@ dependencies = [
 name = "k-ai"
 version = "0.1.0"
 dependencies = [
+ "hey-ai",
+ "k-pay",
  "kernel-crypto",
  "kernel-identity",
  "kernel-storage",
+ "x-koin",
 ]
 
 [[package]]
@@ -515,6 +518,7 @@ version = "0.1.0"
 dependencies = [
  "kernel-crypto",
  "kernel-identity",
+ "x-koin",
 ]
 
 [[package]]

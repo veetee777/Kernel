@@ -3,7 +3,7 @@ name = "planet-k"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
-description = "Planet•K: signed social posts and follows with a verified feed on KERNEL"
+description = "Planet•K: signed social posts, comments, likes, reposts, media and blocks with a verified feed on KERNEL"
 
 [dependencies]
 kernel-crypto = { path = "../kernel-crypto" }

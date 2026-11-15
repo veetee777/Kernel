@@ -8,3 +8,4 @@ description = "Kernel•XChange: a signed order book — buy/sell matching with 
 [dependencies]
 kernel-crypto = { path = "../kernel-crypto" }
 kernel-identity = { path = "../kernel-identity" }
+x-koin = { path = "../x-koin" }

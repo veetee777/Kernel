@@ -19,12 +19,29 @@
 //! a fixed `KAI-TEST:` prefix. It is clearly labeled a test provider.
 //! It is not intelligence, and nothing here pretends otherwise.
 //!
+//! [`agent::LocalAgent`] is a real local agent provider — Kai, the
+//! creator-bundle agent. It routes a task to one of four tools by
+//! deterministic keyword intent (storage search, bundle assembly,
+//! bundle purchase, template rendering through the HEY•AI engine)
+//! and composes the signed response from the tool's actual output.
+//! It never invents an answer: an intent it cannot route is refused.
+//! It is still not a model — the routing is keywords, not
+//! understanding. Bundles are signed manifests over content the
+//! creator supplies ([`bundle::BundleManifest`]); Kai assembles and
+//! sells them, it does not create the content inside them.
+//!
 //! Record formats (explicit binary, no JSON):
 //! `KAITSK1` + id length (u16 LE) + id bytes + owner public key (32) +
 //! prompt length (u32 LE) + prompt bytes + signature (64).
 //! `KAIRESP` + task id length (u16 LE) + task id bytes + provider name
 //! length (u16 LE) + provider name bytes + response length (u32 LE) +
 //! response bytes + provider public key (32) + signature (64).
+
+pub mod agent;
+pub mod bundle;
+
+pub use agent::{LocalAgent, Tool, ToolCall, ToolError};
+pub use bundle::{BundleItem, BundleManifest};
 
 use std::collections::HashMap;
 use std::fmt;
@@ -220,8 +237,7 @@ impl AiTask {
     pub fn encode(&self) -> Vec<u8> {
         let id_bytes = self.id.as_bytes();
         let prompt_bytes = self.prompt.as_bytes();
-        let mut out =
-            Vec::with_capacity(7 + 2 + id_bytes.len() + 32 + 4 + prompt_bytes.len() + 64);
+        let mut out = Vec::with_capacity(7 + 2 + id_bytes.len() + 32 + 4 + prompt_bytes.len() + 64);
         out.extend_from_slice(TASK_MAGIC);
         out.extend_from_slice(&(id_bytes.len() as u16).to_le_bytes());
         out.extend_from_slice(id_bytes);
@@ -369,8 +385,7 @@ impl AiResponse {
                 "missing KAIRESP magic".to_string(),
             ));
         }
-        let task_len =
-            u16::from_le_bytes(bytes[7..9].try_into().expect("2-byte slice")) as usize;
+        let task_len = u16::from_le_bytes(bytes[7..9].try_into().expect("2-byte slice")) as usize;
         let provider_len_off = 9 + task_len;
         if bytes.len() < provider_len_off + 2 {
             return Err(AiError::InvalidResponse(
@@ -411,12 +426,11 @@ impl AiResponse {
         let provider_name = String::from_utf8(
             bytes[provider_len_off + 2..provider_len_off + 2 + provider_len].to_vec(),
         )
-        .map_err(|_| {
-            AiError::InvalidResponse("provider name is not valid UTF-8".to_string())
-        })?;
+        .map_err(|_| AiError::InvalidResponse("provider name is not valid UTF-8".to_string()))?;
         let mut off = text_len_off + 4;
-        let text = String::from_utf8(bytes[off..off + text_len].to_vec())
-            .map_err(|_| AiError::InvalidResponse("response text is not valid UTF-8".to_string()))?;
+        let text = String::from_utf8(bytes[off..off + text_len].to_vec()).map_err(|_| {
+            AiError::InvalidResponse("response text is not valid UTF-8".to_string())
+        })?;
         validate_text(&text)?;
         off += text_len;
         let mut key_bytes = [0u8; 32];
@@ -480,6 +494,12 @@ pub struct AiService {
     responses: HashMap<Cid, AiResponse>,
     /// Response record CIDs, by task id.
     responses_by_task: HashMap<String, Vec<Cid>>,
+}
+
+impl Default for AiService {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AiService {
@@ -759,8 +779,8 @@ mod tests {
         let provider_id = Identity::generate("provider").unwrap();
         let mut service = AiService::new();
         // A response record naming a task this node never saw.
-        let response = AiResponse::new("ghost-task", "test-uppercase", "text", &provider_id)
-            .unwrap();
+        let response =
+            AiResponse::new("ghost-task", "test-uppercase", "text", &provider_id).unwrap();
         let cid = service.store_mut().put(&response.encode());
         assert_eq!(
             service.get_response(&cid),
@@ -787,8 +807,6 @@ mod tests {
         assert!(service.submit_task("", "x", &alice).is_err());
         assert!(service.submit_task("has space", "x", &alice).is_err());
         assert!(service.submit_task("ok-id_1.2", "", &alice).is_err());
-        assert!(service
-            .submit_task("ok-id_1.2", "fine", &alice)
-            .is_ok());
+        assert!(service.submit_task("ok-id_1.2", "fine", &alice).is_ok());
     }
 }

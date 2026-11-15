@@ -9,3 +9,6 @@ description = "K•AI: a signed AI task/response framework on KERNEL (providers 
 kernel-crypto = { path = "../kernel-crypto" }
 kernel-identity = { path = "../kernel-identity" }
 kernel-storage = { path = "../kernel-storage" }
+hey-ai = { path = "../hey-ai" }
+x-koin = { path = "../x-koin" }
+k-pay = { path = "../k-pay" }
