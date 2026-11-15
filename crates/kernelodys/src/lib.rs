@@ -16,8 +16,11 @@
 //! or a tampered chunk fails loudly instead of silently returning wrong
 //! bytes.
 //!
-//! Nothing here plays audio. This crate stores, verifies, and lists
-//! tracks and playlists. Playback is a separate concern.
+//! Nothing here decodes files or touches an audio device. This crate
+//! stores, verifies, and lists tracks and playlists. Playback is the
+//! [`tuning`] module: Kernelodys plays at A = 432 Hz, and
+//! [`tuning::play_432`] retunes decoded PCM to 432 before it reaches
+//! the listener.
 //!
 //! Manifest formats (explicit binary, no JSON):
 //! `KTRACK1` + title length (u16 LE) + title bytes + artist length
@@ -32,6 +35,9 @@ use std::fmt;
 use kernel_crypto::Ed25519Signature;
 use kernel_identity::{Identity, IdentityError, PeerId};
 use kernel_storage::{Cid, ContentStore, StorageError};
+
+/// Playback tuning: Kernelodys plays at A = 432 Hz.
+pub mod tuning;
 
 /// Magic bytes at the start of every track manifest.
 const TRACK_MAGIC: &[u8; 7] = b"KTRACK1";
