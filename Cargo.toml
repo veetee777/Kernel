@@ -35,6 +35,10 @@ members = [
     "crates/kernel-contracts",
     "crates/kernel-webui",
     "crates/kernel-routing",
+  "crates/kernel-sim",
+  "crates/kernel-scripture",
+  "crates/kernel-artifacts",
+  "crates/k-store",
 ]
 
 [workspace.dependencies]

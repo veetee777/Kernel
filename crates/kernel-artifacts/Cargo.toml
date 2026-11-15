@@ -1,0 +1,11 @@
+[package]
+name = "kernel-artifacts"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Religious text manuscripts and artifacts pipeline for KERNEL"
+
+[dependencies]
+kernel-crypto = { path = "../kernel-crypto" }
+kernel-identity = { path = "../kernel-identity" }
+kernel-storage = { path = "../kernel-storage" }

@@ -1,0 +1,13 @@
+[package]
+name = "k-store"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Storefront rendered by HEY-AI, settled on K-Pay and X-Koin"
+
+[dependencies]
+kernel-identity = { path = "../kernel-identity" }
+kernel-storage = { path = "../kernel-storage" }
+x-koin = { path = "../x-koin" }
+k-pay = { path = "../k-pay" }
+hey-ai = { path = "../hey-ai" }

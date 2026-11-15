@@ -10,9 +10,9 @@ that code is still locked behind that account's paywall.
 
 ## What exists
 
-A Cargo workspace (`resolver = "2"`) with thirty-four crates. All compile
+A Cargo workspace (`resolver = "2"`) with thirty-eight crates. All compile
 with no warnings, and all tests pass (`cargo test` from this directory:
-568 tests, 0 failed).
+652 tests, 0 failed).
 
 **Foundation**
 - **`kernel-crypto`** — Ed25519 signing, X25519 key exchange,
@@ -235,7 +235,13 @@ with no warnings, and all tests pass (`cargo test` from this directory:
   signature) parsed by a small fixed router into an action: `Play`
   (with track name), `Pause`, `Next`, `Previous`, `ListTracks`, or
   `Unknown`. Unknown text maps to `Unknown` — never a panic, never an
-  error. Nothing here records, transcribes, or plays audio.
+  error. Nothing here records, transcribes, or plays audio. HEY•AI
+  is also the render engine: a small deterministic template language
+  (`{{name}}` substitution, `{{#each}}` loops, `{{#if}}`
+  conditionals) over an in-crate value type — no JSON, no execution.
+  Rendering is content-addressed (same template + data = same bytes
+  = same address) and a `RenderQueue` runs jobs in order, recording
+  each result. It renders data; it never runs code.
 - **`planet-k` (Planet•K)** — Social. A post is a signed `KPOST1`
   record (author, text, timestamp, optional media chunk root,
   signature); a follow is a signed `KFOL1` record (follower,
@@ -250,6 +256,28 @@ with no warnings, and all tests pass (`cargo test` from this directory:
   `XKOMCMD` record (name, command string, owner, signature);
   `run_command` only appends an execution entry (name, timestamp) to
   a log — **it executes no shell command, ever**.
+- **`kernel-sim`** — The Korn world: a deterministic tick-based grid
+  simulation (64×64, plains/forest/water/mountain), agents that
+  gather, eat, rest, and starve by simple rules, resources that
+  regrow, an append-only event log with replay, binary save/load
+  (`KSIM1`). Same seed + same ticks = the exact same world. Not
+  wired to Planet-K or any other crate yet.
+- **`kernel-scripture`** — Bible study and research pipeline:
+  ingest `Book Chapter:Verse<TAB>text`, verse references with
+  ranges, concordance, word/phrase search, signed study notes,
+  related-verses research queries. Verses are content-addressed.
+  No real Bible text is bundled — the caller supplies it.
+- **`kernel-artifacts`** — Manuscripts and artifacts pipeline:
+  records with content CIDs, signed provenance chains (verified in
+  order on every read), variant links with cycle refusal, enforced
+  stages intake → verify → catalog → publish. Proves integrity and
+  chain order, not truth.
+- **`k-store`** — KERNEL-native storefront: signed listings priced
+  in X•Koin, product pages rendered through the HEY•AI engine,
+  orders settled through K•Pay (seller invoices, buyer pays, stock
+  decrements; failures leave balances and stock untouched). Not
+  Shopify — Tristan already has a Shopify store, and that
+  integration is deferred until the 13 apps have real code.
 
 All 17 apps in the working inventory are now present: 16 as Rust
 crates in this workspace, plus Glassforge, which is the separate

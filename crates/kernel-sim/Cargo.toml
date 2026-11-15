@@ -1,0 +1,10 @@
+[package]
+name = "kernel-sim"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Deterministic tick-based world simulation (the Korn world) for KERNEL"
+
+[dependencies]
+kernel-storage = { path = "../kernel-storage" }
+kernel-identity = { path = "../kernel-identity" }

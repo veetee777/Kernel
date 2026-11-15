@@ -1,0 +1,11 @@
+[package]
+name = "kernel-scripture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Bible study and research pipeline for KERNEL"
+
+[dependencies]
+kernel-crypto = { path = "../kernel-crypto" }
+kernel-identity = { path = "../kernel-identity" }
+kernel-storage = { path = "../kernel-storage" }

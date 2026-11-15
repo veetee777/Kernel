@@ -18,13 +18,21 @@
 //! actions. Recording, transcription, and playback are separate
 //! concerns.
 //!
+//! The same crate also holds HEY•AI's **render engine**: a small
+//! deterministic template language (`{{name}}`, `{{#each}}`,
+//! `{{#if}}`) over plain data values — no JSON, no code execution.
+//! Rendering is pure data transformation: the same template plus
+//! the same data always produces the exact same bytes, addressed
+//! by their SHA-256. A [`RenderQueue`] runs jobs in order and
+//! records each result; a failed job never blocks the next one.
+//!
 //! Formats (explicit binary, no JSON):
 //! `KVOICE1` + name length (u16 LE) + name bytes + duration (u64 LE) +
 //! chunk root CID (32) + owner public key (32) + signature (64).
 //! `KCMDVC1` + text length (u32 LE) + text bytes + owner public key
 //! (32) + signature (64).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
 use kernel_crypto::Ed25519Signature;
@@ -412,8 +420,9 @@ impl VoiceCommand {
                 bytes.len()
             )));
         }
-        let text = String::from_utf8(bytes[11..11 + text_len].to_vec())
-            .map_err(|_| VoiceError::InvalidManifest("command text is not valid UTF-8".to_string()))?;
+        let text = String::from_utf8(bytes[11..11 + text_len].to_vec()).map_err(|_| {
+            VoiceError::InvalidManifest("command text is not valid UTF-8".to_string())
+        })?;
         validate_command_text(&text)?;
         let mut off = 11 + text_len;
         let mut key_bytes = [0u8; 32];
@@ -453,6 +462,13 @@ pub struct VoiceStore {
     notes: HashMap<Cid, VoiceNoteManifest>,
     /// Voice command records this node holds, by record CID.
     commands: HashMap<Cid, VoiceCommand>,
+}
+
+impl Default for VoiceStore {
+    /// An empty voice store, the same as [`VoiceStore::new`].
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl VoiceStore {
@@ -546,11 +562,7 @@ impl VoiceStore {
     /// Submit a voice command: build and sign the record and store it
     /// as a block. Returns the command record CID. Parsing the command
     /// into an action is [`parse_command`] (or [`VoiceCommand::action`]).
-    pub fn submit_command(
-        &mut self,
-        text: &str,
-        identity: &Identity,
-    ) -> Result<Cid, VoiceError> {
+    pub fn submit_command(&mut self, text: &str, identity: &Identity) -> Result<Cid, VoiceError> {
         validate_command_text(text)?;
         let command = VoiceCommand::new(text, identity)?;
         let cid = self.store.put(&command.encode());
@@ -581,6 +593,588 @@ impl VoiceStore {
     #[cfg(test)]
     pub fn store_mut(&mut self) -> &mut ContentStore {
         &mut self.store
+    }
+}
+
+/// Verify a peer's Ed25519 signature over a message, given the
+/// signature as raw bytes. The signature is exactly 64 bytes; any
+/// other length cannot be a signature and fails. This is the
+/// byte-level entry point for crates that hold signatures as raw
+/// bytes (for example, signed listings) without depending on the
+/// crypto crate themselves.
+pub fn verify_signature(peer: &PeerId, message: &[u8], signature_bytes: &[u8; 64]) -> bool {
+    let signature = Ed25519Signature::from_bytes(signature_bytes);
+    peer.verify(message, &signature).is_ok()
+}
+
+// ---------------------------------------------------------------------------
+// Render engine — HEY•AI as a deterministic template renderer
+// ---------------------------------------------------------------------------
+
+/// Maximum template size, in bytes. A bigger template is refused
+/// rather than parsed.
+pub const MAX_TEMPLATE_LEN: usize = 65_536;
+/// Maximum rendered output size, in bytes. Rendering stops with an
+/// error past this point.
+pub const MAX_OUTPUT_LEN: usize = 1_048_576;
+/// Maximum nesting depth of `{{#each}}` / `{{#if}}` blocks.
+pub const MAX_NESTING_DEPTH: usize = 32;
+
+/// A data value for rendering. Templates never see JSON and never
+/// parse it: the caller builds values directly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Value {
+    /// A string.
+    Text(String),
+    /// An integer.
+    Number(i64),
+    /// A boolean.
+    Bool(bool),
+    /// An ordered list.
+    List(Vec<Value>),
+    /// Named fields, in the order given.
+    Map(Vec<(String, Value)>),
+}
+
+impl Value {
+    /// A text value.
+    pub fn text(s: &str) -> Self {
+        Value::Text(s.to_string())
+    }
+
+    /// A number value.
+    pub fn number(n: i64) -> Self {
+        Value::Number(n)
+    }
+
+    /// A boolean value.
+    pub fn bool(b: bool) -> Self {
+        Value::Bool(b)
+    }
+
+    /// A list value.
+    pub fn list(items: Vec<Value>) -> Self {
+        Value::List(items)
+    }
+
+    /// A map value.
+    pub fn map(pairs: Vec<(String, Value)>) -> Self {
+        Value::Map(pairs)
+    }
+
+    /// Look up a field by name. Only maps have fields; anything
+    /// else returns `None`. The first matching pair wins; a later
+    /// pair with the same key is ignored on lookup.
+    pub fn lookup(&self, key: &str) -> Option<&Value> {
+        match self {
+            Value::Map(pairs) => pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+            _ => None,
+        }
+    }
+}
+
+/// Errors returned by template parsing and rendering. Every failure
+/// is a value, never a panic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenderError {
+    /// The template was larger than [`MAX_TEMPLATE_LEN`] bytes.
+    TemplateTooLarge(usize),
+    /// The template was not well-formed (empty tag, unknown block
+    /// tag, bad variable name, mismatched close tag).
+    Malformed(String),
+    /// A tag or block was never closed.
+    UnclosedTag(String),
+    /// The template named a key the data does not have.
+    UnknownKey(String),
+    /// A value had the wrong shape for where it was used (a list
+    /// substituted as text, a non-list in `{{#each}}`, a non-bool
+    /// in `{{#if}}`, non-map data at the top level).
+    TypeMismatch(String),
+    /// The rendered output passed [`MAX_OUTPUT_LEN`] bytes.
+    OutputTooLarge(usize),
+}
+
+impl fmt::Display for RenderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RenderError::TemplateTooLarge(n) => {
+                write!(f, "template is {n} bytes, max is {MAX_TEMPLATE_LEN}")
+            }
+            RenderError::Malformed(msg) => write!(f, "malformed template: {msg}"),
+            RenderError::UnclosedTag(msg) => write!(f, "unclosed tag: {msg}"),
+            RenderError::UnknownKey(key) => write!(f, "unknown key: {key}"),
+            RenderError::TypeMismatch(msg) => write!(f, "type mismatch: {msg}"),
+            RenderError::OutputTooLarge(n) => {
+                write!(f, "rendered output is {n} bytes, max is {MAX_OUTPUT_LEN}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RenderError {}
+
+/// One parsed template node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Node {
+    /// Literal text, copied verbatim.
+    Text(String),
+    /// `{{name}}` — substitute a scalar value.
+    Var(String),
+    /// `{{#each key}}...{{/each}}` — repeat the body for each item.
+    Each { key: String, body: Vec<Node> },
+    /// `{{#if key}}...{{/if}}` — include the body only if the key
+    /// is a true boolean.
+    If { key: String, body: Vec<Node> },
+}
+
+/// A variable name is one word: ASCII letters, digits, `_`, `-`.
+/// `this` is the same kind of name; it is bound inside `{{#each}}`
+/// to the current item.
+fn is_valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Parse nodes until the end of the template or a matching close
+/// tag. `closing` is the block we are inside (`"each"` / `"if"`),
+/// or `None` at the top level.
+fn parse_nodes(
+    template: &str,
+    mut pos: usize,
+    closing: Option<&str>,
+    depth: usize,
+) -> Result<(Vec<Node>, usize), RenderError> {
+    let mut nodes = Vec::new();
+    while pos < template.len() {
+        let rest = &template[pos..];
+        let Some(open) = rest.find("{{") else {
+            nodes.push(Node::Text(rest.to_string()));
+            pos = template.len();
+            break;
+        };
+        if open > 0 {
+            nodes.push(Node::Text(rest[..open].to_string()));
+        }
+        let tag_start = pos + open;
+        let after_open = tag_start + 2;
+        let Some(close_rel) = template[after_open..].find("}}") else {
+            return Err(RenderError::UnclosedTag(format!(
+                "tag starting at byte {tag_start} has no closing '}}}}'"
+            )));
+        };
+        let tag = template[after_open..after_open + close_rel].trim();
+        let next_pos = after_open + close_rel + 2;
+        if tag.is_empty() {
+            return Err(RenderError::Malformed(format!(
+                "empty tag at byte {tag_start}"
+            )));
+        }
+        if let Some(close_name) = tag.strip_prefix('/').map(str::trim) {
+            match closing {
+                Some(expected) if close_name == expected => {
+                    return Ok((nodes, next_pos));
+                }
+                Some(expected) => {
+                    return Err(RenderError::Malformed(format!(
+                        "closing tag '{{{{/{close_name}}}}}' does not match open '{{{{#{expected}}}}}'"
+                    )));
+                }
+                None => {
+                    return Err(RenderError::Malformed(format!(
+                        "closing tag '{{{{/{close_name}}}}}' with no open block"
+                    )));
+                }
+            }
+        }
+        if tag == "#each" || tag.starts_with("#each ") {
+            let key = tag[5..].trim();
+            if !is_valid_name(key) {
+                return Err(RenderError::Malformed(format!(
+                    "'{{{{#each}}}}' needs a variable name, got '{{{{ {tag} }}}}'"
+                )));
+            }
+            if depth >= MAX_NESTING_DEPTH {
+                return Err(RenderError::Malformed(
+                    "template blocks nest too deep".to_string(),
+                ));
+            }
+            let (body, new_pos) = parse_nodes(template, next_pos, Some("each"), depth + 1)?;
+            nodes.push(Node::Each {
+                key: key.to_string(),
+                body,
+            });
+            pos = new_pos;
+            continue;
+        }
+        if tag == "#if" || tag.starts_with("#if ") {
+            let key = tag[3..].trim();
+            if !is_valid_name(key) {
+                return Err(RenderError::Malformed(format!(
+                    "'{{{{#if}}}}' needs a variable name, got '{{{{ {tag} }}}}'"
+                )));
+            }
+            if depth >= MAX_NESTING_DEPTH {
+                return Err(RenderError::Malformed(
+                    "template blocks nest too deep".to_string(),
+                ));
+            }
+            let (body, new_pos) = parse_nodes(template, next_pos, Some("if"), depth + 1)?;
+            nodes.push(Node::If {
+                key: key.to_string(),
+                body,
+            });
+            pos = new_pos;
+            continue;
+        }
+        if tag.starts_with('#') {
+            return Err(RenderError::Malformed(format!(
+                "unknown block tag '{{{{ {tag} }}}}'"
+            )));
+        }
+        if !is_valid_name(tag) {
+            return Err(RenderError::Malformed(format!(
+                "invalid variable name '{{{{ {tag} }}}}'"
+            )));
+        }
+        nodes.push(Node::Var(tag.to_string()));
+        pos = next_pos;
+    }
+    match closing {
+        Some(name) => Err(RenderError::UnclosedTag(format!(
+            "'{{{{#{name}}}}}' block is never closed"
+        ))),
+        None => Ok((nodes, pos)),
+    }
+}
+
+/// Parse a whole template.
+fn parse_template(template: &str) -> Result<Vec<Node>, RenderError> {
+    if template.len() > MAX_TEMPLATE_LEN {
+        return Err(RenderError::TemplateTooLarge(template.len()));
+    }
+    let (nodes, _) = parse_nodes(template, 0, None, 0)?;
+    Ok(nodes)
+}
+
+/// Look a name up through the scope stack, innermost first.
+fn lookup<'a>(scopes: &'a [HashMap<String, Value>], name: &str) -> Option<&'a Value> {
+    scopes.iter().rev().find_map(|scope| scope.get(name))
+}
+
+/// Render a scalar value as text. Lists and maps have no text
+/// form — they must be used with `{{#each}}`.
+fn format_value(value: &Value) -> Option<String> {
+    match value {
+        Value::Text(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::List(_) | Value::Map(_) => None,
+    }
+}
+
+fn render_nodes(
+    nodes: &[Node],
+    scopes: &mut Vec<HashMap<String, Value>>,
+    out: &mut Vec<u8>,
+) -> Result<(), RenderError> {
+    for node in nodes {
+        match node {
+            Node::Text(text) => out.extend_from_slice(text.as_bytes()),
+            Node::Var(name) => {
+                let value =
+                    lookup(scopes, name).ok_or_else(|| RenderError::UnknownKey(name.clone()))?;
+                let text = format_value(value).ok_or_else(|| {
+                    RenderError::TypeMismatch(format!(
+                        "key '{name}' is a list or map and cannot be substituted as text"
+                    ))
+                })?;
+                out.extend_from_slice(text.as_bytes());
+            }
+            Node::Each { key, body } => {
+                let items =
+                    lookup(scopes, key).ok_or_else(|| RenderError::UnknownKey(key.clone()))?;
+                let items = match items {
+                    Value::List(items) => items.clone(),
+                    _ => {
+                        return Err(RenderError::TypeMismatch(format!(
+                            "key '{key}' is not a list, so '{{{{#each {key}}}}}' cannot loop over it"
+                        )));
+                    }
+                };
+                for item in &items {
+                    let mut scope = HashMap::new();
+                    scope.insert("this".to_string(), item.clone());
+                    if let Value::Map(pairs) = item {
+                        for (k, v) in pairs {
+                            scope.entry(k.clone()).or_insert_with(|| v.clone());
+                        }
+                    }
+                    scopes.push(scope);
+                    render_nodes(body, scopes, out)?;
+                    scopes.pop();
+                }
+            }
+            Node::If { key, body } => {
+                let flag =
+                    lookup(scopes, key).ok_or_else(|| RenderError::UnknownKey(key.clone()))?;
+                match flag {
+                    Value::Bool(true) => render_nodes(body, scopes, out)?,
+                    Value::Bool(false) => {}
+                    _ => {
+                        return Err(RenderError::TypeMismatch(format!(
+                            "key '{key}' is not a boolean, so '{{{{#if {key}}}}}' cannot test it"
+                        )));
+                    }
+                }
+            }
+        }
+        if out.len() > MAX_OUTPUT_LEN {
+            return Err(RenderError::OutputTooLarge(out.len()));
+        }
+    }
+    Ok(())
+}
+
+/// Render a template against top-level map data.
+///
+/// The template language is small and deterministic:
+/// * `{{name}}` substitutes a text, number, or boolean value.
+/// * `{{#each items}}...{{/each}}` repeats the body once per item
+///   in a list; inside, `{{this}}` is the item, and a map item's
+///   fields are visible by name.
+/// * `{{#if flag}}...{{/if}}` includes the body only when `flag`
+///   is a true boolean.
+/// * Anything else — unclosed tags, unknown keys, malformed
+///   templates — is a [`RenderError`], never a panic.
+///
+/// The same template plus the same data always produces the exact
+/// same bytes. Rendering is pure data transformation: no code is
+/// executed, no shell is involved.
+pub fn render(template: &str, data: &Value) -> Result<Vec<u8>, RenderError> {
+    let nodes = parse_template(template)?;
+    let mut scopes = match data {
+        Value::Map(pairs) => {
+            let mut top = HashMap::new();
+            for (k, v) in pairs {
+                top.insert(k.clone(), v.clone());
+            }
+            vec![top]
+        }
+        _ => {
+            return Err(RenderError::TypeMismatch(
+                "template data must be a map of named fields".to_string(),
+            ));
+        }
+    };
+    let mut out = Vec::new();
+    render_nodes(&nodes, &mut scopes, &mut out)?;
+    Ok(out)
+}
+
+/// A rendered output: the bytes plus their content address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenderedOutput {
+    /// The rendered bytes.
+    pub bytes: Vec<u8>,
+    /// SHA-256 of the bytes, as a content address.
+    pub address: Cid,
+}
+
+/// Render a template and address the output by its hash. The same
+/// template plus the same data always yields the same address.
+pub fn render_addressed(template: &str, data: &Value) -> Result<RenderedOutput, RenderError> {
+    let bytes = render(template, data)?;
+    let address = Cid::from_bytes(kernel_crypto::sha256(&bytes));
+    Ok(RenderedOutput { bytes, address })
+}
+
+/// A canonical byte encoding of a value, for hashing. Map pairs are
+/// sorted by key, so the same data in a different field order hashes
+/// the same.
+fn canonical_bytes(value: &Value, out: &mut Vec<u8>) {
+    match value {
+        Value::Text(s) => {
+            out.push(b'T');
+            out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            out.extend_from_slice(s.as_bytes());
+        }
+        Value::Number(n) => {
+            out.push(b'N');
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+        Value::Bool(b) => {
+            out.push(if *b { b'B' } else { b'b' });
+        }
+        Value::List(items) => {
+            out.push(b'L');
+            out.extend_from_slice(&(items.len() as u32).to_le_bytes());
+            for item in items {
+                canonical_bytes(item, out);
+            }
+        }
+        Value::Map(pairs) => {
+            out.push(b'M');
+            let mut sorted: Vec<&(String, Value)> = pairs.iter().collect();
+            sorted.sort_by(|a, b| a.0.cmp(&b.0));
+            out.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
+            for (k, v) in sorted {
+                out.extend_from_slice(&(k.len() as u32).to_le_bytes());
+                out.extend_from_slice(k.as_bytes());
+                canonical_bytes(v, out);
+            }
+        }
+    }
+}
+
+/// The input hash of a render job: SHA-256 over a domain separator,
+/// the template bytes, and the canonical data encoding. Two jobs
+/// with the same template and the same data have the same input
+/// hash, whatever order the data fields were given in.
+pub fn input_hash(template: &str, data: &Value) -> Cid {
+    let mut bytes = b"HEYAI-RENDER1".to_vec();
+    bytes.extend_from_slice(template.as_bytes());
+    bytes.push(0);
+    canonical_bytes(data, &mut bytes);
+    Cid::from_bytes(kernel_crypto::sha256(&bytes))
+}
+
+/// A render job: a template plus its data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenderJob {
+    /// The template to render.
+    pub template: String,
+    /// The data the template reads.
+    pub data: Value,
+}
+
+/// The status of a render job.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JobStatus {
+    /// Submitted, not run yet.
+    Pending,
+    /// Rendered. `output` is the content address of the rendered
+    /// bytes.
+    Done {
+        /// The rendered output's content address.
+        output: Cid,
+        /// The rendered output's length in bytes.
+        output_len: usize,
+    },
+    /// Rendering failed. The message is the render error.
+    Failed(String),
+}
+
+/// The recorded result of one render job.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobRecord {
+    /// The job's id, assigned in submission order.
+    pub id: u64,
+    /// The hash of the job's template plus data.
+    pub input_hash: Cid,
+    /// Where the job stands.
+    pub status: JobStatus,
+}
+
+/// A queue of render jobs, run in submission order. A failed job
+/// records its error and never blocks the jobs after it.
+pub struct RenderQueue {
+    next_id: u64,
+    pending: VecDeque<(u64, RenderJob)>,
+    results: Vec<JobRecord>,
+    outputs: HashMap<u64, Vec<u8>>,
+}
+
+impl Default for RenderQueue {
+    /// An empty queue, the same as [`RenderQueue::new`].
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RenderQueue {
+    /// An empty queue. Job ids start at 1.
+    pub fn new() -> Self {
+        Self {
+            next_id: 1,
+            pending: VecDeque::new(),
+            results: Vec::new(),
+            outputs: HashMap::new(),
+        }
+    }
+
+    /// Submit a job. Returns its id. Submission never fails: a bad
+    /// template is discovered when the job runs, and recorded as a
+    /// failed result.
+    pub fn submit(&mut self, template: &str, data: Value) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        let hash = input_hash(template, &data);
+        self.pending.push_back((
+            id,
+            RenderJob {
+                template: template.to_string(),
+                data,
+            },
+        ));
+        self.results.push(JobRecord {
+            id,
+            input_hash: hash,
+            status: JobStatus::Pending,
+        });
+        id
+    }
+
+    /// Number of jobs waiting to run.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// All recorded results, in submission order.
+    pub fn results(&self) -> &[JobRecord] {
+        &self.results
+    }
+
+    /// The recorded result for one job, if it was submitted.
+    pub fn result(&self, id: u64) -> Option<&JobRecord> {
+        self.results.iter().find(|r| r.id == id)
+    }
+
+    /// The rendered bytes of a finished job, if it succeeded.
+    pub fn output_bytes(&self, id: u64) -> Option<&[u8]> {
+        self.outputs.get(&id).map(|b| b.as_slice())
+    }
+
+    /// Run the next pending job, if any. Returns its id. A failure
+    /// is recorded on the job and does not stop the queue.
+    pub fn run_next(&mut self) -> Option<u64> {
+        let (id, job) = self.pending.pop_front()?;
+        self.run_one(id, job);
+        Some(id)
+    }
+
+    /// Run every pending job, in submission order.
+    pub fn run_all(&mut self) {
+        while self.run_next().is_some() {}
+    }
+
+    fn run_one(&mut self, id: u64, job: RenderJob) {
+        match render_addressed(&job.template, &job.data) {
+            Ok(rendered) => {
+                let output_len = rendered.bytes.len();
+                let output = rendered.address;
+                self.outputs.insert(id, rendered.bytes);
+                if let Some(record) = self.results.iter_mut().find(|r| r.id == id) {
+                    record.status = JobStatus::Done { output, output_len };
+                }
+            }
+            Err(e) => {
+                if let Some(record) = self.results.iter_mut().find(|r| r.id == id) {
+                    record.status = JobStatus::Failed(e.to_string());
+                }
+            }
+        }
     }
 }
 
@@ -736,5 +1330,272 @@ mod tests {
         let listed = voice.list_voice_notes();
         let names: Vec<&str> = listed.iter().map(|(_, n)| n.as_str()).collect();
         assert_eq!(names, vec!["apple", "mango", "zebra"]);
+    }
+
+    // --- Render engine tests ---
+
+    fn sample_data() -> Value {
+        Value::map(vec![
+            ("name".to_string(), Value::text("Tristan")),
+            ("price".to_string(), Value::number(250)),
+            ("in_stock".to_string(), Value::bool(true)),
+            (
+                "items".to_string(),
+                Value::list(vec![Value::text("lamp"), Value::text("chair")]),
+            ),
+        ])
+    }
+
+    fn rendered(template: &str, data: &Value) -> String {
+        String::from_utf8(render(template, data).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn template_substitution() {
+        let data = sample_data();
+        assert_eq!(
+            rendered("Hello {{name}}, {{price}} coins.", &data),
+            "Hello Tristan, 250 coins."
+        );
+        assert_eq!(rendered("In stock: {{in_stock}}", &data), "In stock: true");
+        // Spaces inside tags are fine.
+        assert_eq!(rendered("Hello {{ name }}!", &data), "Hello Tristan!");
+        // A template with no tags is literal text.
+        assert_eq!(rendered("plain text", &data), "plain text");
+    }
+
+    #[test]
+    fn template_loops() {
+        let data = sample_data();
+        assert_eq!(
+            rendered("{{#each items}}[{{this}}]{{/each}}", &data),
+            "[lamp][chair]"
+        );
+        // An empty list renders nothing.
+        let empty = Value::map(vec![("items".to_string(), Value::list(vec![]))]);
+        assert_eq!(rendered("{{#each items}}x{{/each}}", &empty), "");
+        // Looping over maps exposes each item's fields by name.
+        let products = Value::map(vec![(
+            "products".to_string(),
+            Value::list(vec![
+                Value::map(vec![
+                    ("name".to_string(), Value::text("lamp")),
+                    ("price".to_string(), Value::number(250)),
+                ]),
+                Value::map(vec![
+                    ("name".to_string(), Value::text("chair")),
+                    ("price".to_string(), Value::number(80)),
+                ]),
+            ]),
+        )]);
+        assert_eq!(
+            rendered("{{#each products}}{{name}}={{price}};{{/each}}", &products),
+            "lamp=250;chair=80;"
+        );
+    }
+
+    #[test]
+    fn template_conditionals() {
+        let data = sample_data();
+        assert_eq!(rendered("{{#if in_stock}}yes{{/if}}", &data), "yes");
+        let out = Value::map(vec![("in_stock".to_string(), Value::bool(false))]);
+        assert_eq!(rendered("{{#if in_stock}}yes{{/if}}", &out), "");
+        assert_eq!(rendered("{{#if in_stock}}yes{{/if}}no", &out), "no");
+    }
+
+    #[test]
+    fn template_nested_loops() {
+        let groups = Value::map(vec![(
+            "groups".to_string(),
+            Value::list(vec![
+                Value::map(vec![(
+                    "members".to_string(),
+                    Value::list(vec![Value::text("a"), Value::text("b")]),
+                )]),
+                Value::map(vec![(
+                    "members".to_string(),
+                    Value::list(vec![Value::text("c"), Value::text("d")]),
+                )]),
+            ]),
+        )]);
+        assert_eq!(
+            rendered(
+                "{{#each groups}}{{#each members}}{{this}},{{/each}}|{{/each}}",
+                &groups
+            ),
+            "a,b,|c,d,|"
+        );
+    }
+
+    #[test]
+    fn unknown_key_refused() {
+        let data = sample_data();
+        assert_eq!(
+            render("Hello {{missing}}", &data),
+            Err(RenderError::UnknownKey("missing".to_string()))
+        );
+        assert_eq!(
+            render("{{#each missing}}x{{/each}}", &data),
+            Err(RenderError::UnknownKey("missing".to_string()))
+        );
+        assert_eq!(
+            render("{{#if missing}}x{{/if}}", &data),
+            Err(RenderError::UnknownKey("missing".to_string()))
+        );
+    }
+
+    #[test]
+    fn malformed_template_refused() {
+        let data = sample_data();
+        // Unclosed block.
+        assert!(matches!(
+            render("{{#each items}}x", &data),
+            Err(RenderError::UnclosedTag(_))
+        ));
+        // Unclosed tag.
+        assert!(matches!(
+            render("Hello {{name", &data),
+            Err(RenderError::UnclosedTag(_))
+        ));
+        // Empty tag.
+        assert!(matches!(
+            render("Hello {{}}", &data),
+            Err(RenderError::Malformed(_))
+        ));
+        // Closing tag with no open block.
+        assert!(matches!(
+            render("x{{/each}}", &data),
+            Err(RenderError::Malformed(_))
+        ));
+        // Mismatched close tag.
+        assert!(matches!(
+            render("{{#each items}}x{{/if}}", &data),
+            Err(RenderError::Malformed(_))
+        ));
+        // Block tag with no key.
+        assert!(matches!(
+            render("{{#each}}x{{/each}}", &data),
+            Err(RenderError::Malformed(_))
+        ));
+        assert!(matches!(
+            render("{{#if}}x{{/if}}", &data),
+            Err(RenderError::Malformed(_))
+        ));
+        // Unknown block tag.
+        assert!(matches!(
+            render("{{#foo}}x{{/foo}}", &data),
+            Err(RenderError::Malformed(_))
+        ));
+        // Bad variable name.
+        assert!(matches!(
+            render("{{na me}}", &data),
+            Err(RenderError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn type_errors_are_clean() {
+        let data = sample_data();
+        // A list cannot be substituted as text.
+        assert!(matches!(
+            render("{{items}}", &data),
+            Err(RenderError::TypeMismatch(_))
+        ));
+        // #each needs a list.
+        assert!(matches!(
+            render("{{#each name}}x{{/each}}", &data),
+            Err(RenderError::TypeMismatch(_))
+        ));
+        // #if needs a boolean.
+        assert!(matches!(
+            render("{{#if price}}x{{/if}}", &data),
+            Err(RenderError::TypeMismatch(_))
+        ));
+        // Top-level data must be a map.
+        assert!(matches!(
+            render("{{this}}", &Value::text("nope")),
+            Err(RenderError::TypeMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn deterministic_rendering() {
+        let data = sample_data();
+        let first = render_addressed("Hello {{name}}, {{price}} coins.", &data).unwrap();
+        let second = render_addressed("Hello {{name}}, {{price}} coins.", &data).unwrap();
+        assert_eq!(first.bytes, second.bytes);
+        assert_eq!(first.address, second.address);
+        assert_eq!(
+            first.address,
+            Cid::from_bytes(kernel_crypto::sha256(&first.bytes))
+        );
+        // Different data, different address.
+        let mut other = sample_data();
+        if let Value::Map(pairs) = &mut other {
+            pairs[0].1 = Value::text("Someone else");
+        }
+        let third = render_addressed("Hello {{name}}, {{price}} coins.", &other).unwrap();
+        assert_ne!(first.address, third.address);
+        // Same data in a different field order: same input hash.
+        let reordered = Value::map(vec![
+            (
+                "items".to_string(),
+                Value::list(vec![Value::text("lamp"), Value::text("chair")]),
+            ),
+            ("in_stock".to_string(), Value::bool(true)),
+            ("price".to_string(), Value::number(250)),
+            ("name".to_string(), Value::text("Tristan")),
+        ]);
+        assert_eq!(
+            input_hash("Hello {{name}}", &data),
+            input_hash("Hello {{name}}", &reordered)
+        );
+    }
+
+    #[test]
+    fn job_queue_runs_in_order_and_failure_does_not_block() {
+        let mut queue = RenderQueue::new();
+        let good = sample_data();
+        let id1 = queue.submit("Hello {{name}}", good.clone());
+        let id2 = queue.submit("Hello {{missing}}", good.clone());
+        let id3 = queue.submit("{{price}} coins", good.clone());
+        assert_eq!((id1, id2, id3), (1, 2, 3));
+        assert_eq!(queue.pending_count(), 3);
+        queue.run_all();
+        assert_eq!(queue.pending_count(), 0);
+
+        let results = queue.results().to_vec();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].id, 1);
+        assert_eq!(results[1].id, 2);
+        assert_eq!(results[2].id, 3);
+        assert!(matches!(results[0].status, JobStatus::Done { .. }));
+        assert!(matches!(results[1].status, JobStatus::Failed(_)));
+        // The failed job did not block the third one.
+        assert!(matches!(results[2].status, JobStatus::Done { .. }));
+        assert_eq!(queue.output_bytes(1).unwrap(), b"Hello Tristan");
+        assert_eq!(queue.output_bytes(2), None);
+        assert_eq!(queue.output_bytes(3).unwrap(), b"250 coins");
+        // Identical jobs share an input hash.
+        let id4 = queue.submit("Hello {{name}}", good);
+        assert_eq!(queue.result(id4).unwrap().input_hash, results[0].input_hash);
+        assert_eq!(queue.result(id4).unwrap().status, JobStatus::Pending);
+    }
+
+    #[test]
+    fn job_queue_run_next_one_at_a_time() {
+        let mut queue = RenderQueue::new();
+        let data = sample_data();
+        let id1 = queue.submit("{{name}}", data.clone());
+        let id2 = queue.submit("{{price}}", data);
+        assert_eq!(queue.run_next(), Some(id1));
+        assert_eq!(queue.pending_count(), 1);
+        assert!(matches!(
+            queue.result(id1).unwrap().status,
+            JobStatus::Done { .. }
+        ));
+        assert_eq!(queue.result(id2).unwrap().status, JobStatus::Pending);
+        assert_eq!(queue.run_next(), Some(id2));
+        assert_eq!(queue.run_next(), None);
     }
 }

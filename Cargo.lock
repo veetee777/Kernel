@@ -284,6 +284,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "k-store"
+version = "0.0.0"
+dependencies = [
+ "hey-ai",
+ "k-pay",
+ "kernel-identity",
+ "kernel-storage",
+ "x-koin",
+]
+
+[[package]]
 name = "k-talk"
 version = "0.1.0"
 dependencies = [
@@ -299,6 +310,15 @@ dependencies = [
  "kernel-crypto",
  "kernel-identity",
  "x-koin",
+]
+
+[[package]]
+name = "kernel-artifacts"
+version = "0.0.0"
+dependencies = [
+ "kernel-crypto",
+ "kernel-identity",
+ "kernel-storage",
 ]
 
 [[package]]
@@ -410,12 +430,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernel-scripture"
+version = "0.0.0"
+dependencies = [
+ "kernel-crypto",
+ "kernel-identity",
+ "kernel-storage",
+]
+
+[[package]]
 name = "kernel-session"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "kernel-carrier",
  "kernel-transport",
+]
+
+[[package]]
+name = "kernel-sim"
+version = "0.0.0"
+dependencies = [
+ "kernel-identity",
+ "kernel-storage",
 ]
 
 [[package]]
