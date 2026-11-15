@@ -9,11 +9,12 @@
 //! Persistence: [`Node::open`] keeps blocks in a binary log on disk
 //! ([`kernel_store_disk::DiskStore`]), so a node that restarts still
 //! holds what it stored. `store_local` on a persistent node returns
-//! only after the bytes are fsync'd to disk. One honest limit: the
-//! node's *identity* is not persisted yet — a restarted node gets a
-//! fresh identity (new PeerId) while its blocks survive under their
-//! content-addressed CIDs. Persisting the private key is separate
-//! work (encryption at rest, owner-only permissions).
+//! only after the bytes are fsync'd to disk. The identity is persisted
+//! too, in `identity.kid` under the same directory
+//! ([`kernel_identity_disk`], owner-only 0600, no passphrase — a
+//! passphrase-wrapped identity can be created with the identity-disk
+//! API directly, but `open` will refuse to load it without a
+//! passphrase). A restarted node keeps its PeerId and its blocks.
 //!
 //! Trust rule: a node only serves blocks it actually holds, and a block
 //! is only accepted if its bytes hash to the CID that was requested.
@@ -47,6 +48,8 @@ pub enum NodeError {
     Network(String),
     /// The on-disk store failed (message only; see [`DiskError`]).
     Disk(String),
+    /// The identity file failed (load, save, or corrupt bytes).
+    IdentityDisk(String),
 }
 
 impl fmt::Display for NodeError {
@@ -58,11 +61,18 @@ impl fmt::Display for NodeError {
             NodeError::BlockNotFound(cid) => write!(f, "peer does not hold block {cid}"),
             NodeError::Network(msg) => write!(f, "network error: {msg}"),
             NodeError::Disk(msg) => write!(f, "disk store error: {msg}"),
+            NodeError::IdentityDisk(msg) => write!(f, "identity file error: {msg}"),
         }
     }
 }
 
 impl std::error::Error for NodeError {}
+
+impl From<kernel_identity_disk::IdentityDiskError> for NodeError {
+    fn from(e: kernel_identity_disk::IdentityDiskError) -> Self {
+        NodeError::IdentityDisk(e.to_string())
+    }
+}
 
 impl From<StorageError> for NodeError {
     fn from(e: StorageError) -> Self {
@@ -171,8 +181,12 @@ impl Node {
 
     /// Open a persistent node: blocks live in a binary log under `dir`
     /// and survive restarts. Blocks stored earlier are loaded back into
-    /// memory on open. The identity is still fresh each open — see the
-    /// module docs for that limit.
+    /// memory on open. The identity lives in `identity.kid` under the
+    /// same directory: if the file exists it is loaded (a corrupt file
+    /// is an error — a new identity is never silently generated over
+    /// one); if it does not exist, a fresh identity is generated and
+    /// saved. The saved identity wins over `display_name` on reopen:
+    /// the name is only used when the identity is first created.
     pub fn open(dir: &Path, display_name: &str) -> Result<Self, NodeError> {
         let mut disk = DiskStore::open(dir)?;
         let mut store = ContentStore::new();
@@ -182,8 +196,16 @@ impl Node {
             // each block's hash on load.
             store.put(&bytes);
         }
+        let identity_path = dir.join("identity.kid");
+        let identity = if identity_path.exists() {
+            kernel_identity_disk::load(&identity_path)?
+        } else {
+            let identity = Identity::generate(display_name)?;
+            kernel_identity_disk::save(&identity, &identity_path)?;
+            identity
+        };
         Ok(Self {
-            identity: Identity::generate(display_name)?,
+            identity,
             store,
             disk: Some(disk),
         })
@@ -442,16 +464,21 @@ mod tests {
         let dir = node_test_dir("persist");
         let cid;
         let root;
+        let first_peer;
         {
             let mut node = Node::open(&dir, "alice").unwrap();
             assert!(node.is_persistent());
+            first_peer = node.peer_id().clone();
+            // The identity was saved on first open.
+            assert!(dir.join("identity.kid").exists());
             cid = node.store_local(b"still here after restart").unwrap();
             let data: Vec<u8> = (0..700 * 1024).map(|i| (i % 251) as u8).collect();
             root = node.store_local_chunked(&data).unwrap();
         }
-        // Drop and reopen: a new identity, the same blocks.
+        // Drop and reopen: the same identity and the same blocks.
         let mut reopened = Node::open(&dir, "alice").unwrap();
         assert!(reopened.is_persistent());
+        assert_eq!(*reopened.peer_id(), first_peer);
         assert_eq!(
             reopened.get_local(&cid).unwrap(),
             b"still here after restart"
@@ -460,6 +487,38 @@ mod tests {
         // Storing the same bytes again does not duplicate them on disk.
         let cid2 = reopened.store_local(b"still here after restart").unwrap();
         assert_eq!(cid, cid2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reopen_keeps_the_saved_identity_even_with_another_name() {
+        let dir = node_test_dir("rename");
+        let first_peer;
+        {
+            let node = Node::open(&dir, "alice").unwrap();
+            first_peer = node.peer_id().clone();
+        }
+        // The name argument is only used on first creation.
+        let reopened = Node::open(&dir, "bob").unwrap();
+        assert_eq!(*reopened.peer_id(), first_peer);
+        assert_eq!(reopened.peer_id().display_name(), "alice");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_identity_file_is_an_error_and_is_not_overwritten() {
+        let dir = node_test_dir("badid");
+        {
+            let _node = Node::open(&dir, "alice").unwrap();
+        }
+        let path = dir.join("identity.kid");
+        let before = std::fs::read(&path).unwrap();
+        let mut bad = before.clone();
+        bad[0] = b'X'; // break the magic
+        std::fs::write(&path, &bad).unwrap();
+        assert!(Node::open(&dir, "alice").is_err());
+        // The corrupt file was left alone, not replaced.
+        assert_eq!(std::fs::read(&path).unwrap(), bad);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

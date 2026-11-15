@@ -12,7 +12,7 @@ that code is still locked behind that account's paywall.
 
 A Cargo workspace (`resolver = "2"`) with twenty-nine crates. All compile
 with no warnings, and all tests pass (`cargo test` from this directory:
-388 tests, 0 failed).
+393 tests, 0 failed).
 
 **Foundation**
 - **`kernel-crypto`** — Ed25519 signing, X25519 key exchange,
@@ -32,8 +32,10 @@ with no warnings, and all tests pass (`cargo test` from this directory:
   together. In-process transport (channels) lets two nodes exchange
   blocks by CID in tests. A node serves only blocks it holds, and a
   request for content it was never given returns a clean error.
-  `Node::open` persists blocks to disk (see `kernel-store-disk`);
-  `net` adds real TCP block exchange between machines.
+  `Node::open` persists blocks to disk (see `kernel-store-disk`) and
+  the identity in `identity.kid` (see `kernel-identity-disk`), so a
+  restarted node keeps its PeerId and its blocks; `net` adds real
+  TCP block exchange between machines.
 - **`kernel-store-disk`** — Persistent content-addressed store: one
   append-only binary log (`blocks.klog`), `KBLK1` records, fsync per
   put, hash-verified on open and on read. A torn final record from a
@@ -49,7 +51,8 @@ with no warnings, and all tests pass (`cargo test` from this directory:
   SHA-256 of a peer's public key; k-buckets (K=20) with LRU eviction;
   `find_node` by XOR distance; values stored with the storing peer's
   signature, verified at store time and on read. A missing key returns
-  the closest nodes, not an error.
+  the closest nodes, not an error. `Dht::learn_discovered` feeds
+  verified discovery records into the routing table.
 - **`kernel-replication`** — Distributed storage replication over TCP.
   Replica nodes serve STORE/FETCH; `replicate` copies a block to N
   peers (bytes are hash-verified against the CID on receipt, so lying
@@ -219,11 +222,11 @@ Android launcher project, not a Rust crate.
 - Real peer discovery and NAT traversal (the DHT is in-memory and has
   no network peer exchange yet; replication and talk use explicit
   addresses, not DHT-discovered peers). `kernel-discovery` finds
-  peers by direct exchange, but nothing feeds them into the DHT yet.
+  peers by direct exchange and `Dht::learn_discovered` feeds them
+  into the routing table; NAT traversal is still missing.
 - Persistence: `kernel-store-disk` exists (append-only log, no
-  compaction yet); identity persistence exists (`kernel-identity-disk`).
-  The node's `Node::open` does not yet load a saved identity — that
-  wiring is still to do.
+  compaction yet); identity persistence exists and `Node::open`
+  loads it. Still to do: store-disk compaction.
 - The carrier's remaining pieces: real audio codec (Opus), radio
   trait, multi-hop routing, discovery, time-based rekey trigger,
   identity hiding.

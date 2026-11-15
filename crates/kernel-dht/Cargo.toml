@@ -7,4 +7,5 @@ description = "KERNEL Kademlia-style distributed hash table (in-memory)"
 
 [dependencies]
 kernel-crypto = { path = "../kernel-crypto" }
+kernel-discovery = { path = "../kernel-discovery" }
 kernel-identity = { path = "../kernel-identity" }

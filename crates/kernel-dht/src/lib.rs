@@ -20,6 +20,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
 use kernel_crypto::{sha256, Ed25519Signature};
+use kernel_discovery::PeerTable;
 use kernel_identity::{IdentityError, PeerId};
 
 /// Number of peers per k-bucket.
@@ -199,6 +200,28 @@ impl Dht {
         bucket.push_back(id);
     }
 
+    /// Learn every peer in a discovery table. A `PeerTable` only holds
+    /// records whose signatures already verified at insert time, so
+    /// every peer learned here is authenticated — a forged record
+    /// cannot reach this method through the table. Returns the number
+    /// of peers newly added (already-known peers are refreshed, not
+    /// counted; the local peer is never added).
+    pub fn learn_discovered(&mut self, table: &PeerTable) -> usize {
+        let mut added = 0;
+        for record in table.records() {
+            let peer = record.peer();
+            if !self.contains(peer) {
+                self.seen(peer);
+                // seen() skips the local peer, so only count a real insert.
+                if self.contains(peer) {
+                    added += 1;
+                }
+            } else {
+                self.seen(peer);
+            }
+        }
+        added
+    }
     /// True if this peer's ID is in the routing table.
     pub fn contains(&self, peer: &PeerId) -> bool {
         let id = NodeId::from_peer(peer);
@@ -289,6 +312,7 @@ impl Dht {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kernel_discovery::PeerRecord;
     use kernel_identity::Identity;
 
     fn node_id_with_first_byte(b: u8) -> NodeId {
@@ -506,5 +530,81 @@ mod tests {
         // Seeing the local peer does nothing.
         dht.seen(local.peer_id());
         assert_eq!(dht.peer_count(), 1);
+    }
+
+    fn discovered_table(local: &Identity, peers: &[Identity]) -> PeerTable {
+        let mut table = PeerTable::new();
+        for (i, p) in peers.iter().enumerate() {
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 7000 + i as u16));
+            table
+                .insert(PeerRecord::new(p, addr, 1_000))
+                .expect("insert");
+        }
+        // A record for the local peer, if one is passed in as a peer.
+        let _ = local;
+        table
+    }
+
+    #[test]
+    fn discovered_peers_land_in_the_routing_table() {
+        let local = Identity::generate("local").unwrap();
+        let peers: Vec<Identity> = (0..3)
+            .map(|i| Identity::generate(&format!("peer{i}")).unwrap())
+            .collect();
+        let table = discovered_table(&local, &peers);
+        assert_eq!(table.len(), 3);
+
+        let mut dht = Dht::new(local.peer_id());
+        assert_eq!(dht.learn_discovered(&table), 3);
+        assert_eq!(dht.peer_count(), 3);
+        for p in &peers {
+            assert!(dht.contains(p.peer_id()));
+        }
+        // find_node returns the learned peers.
+        let target = NodeId::from_peer(peers[0].peer_id());
+        let found = dht.find_node(&target, 10);
+        assert_eq!(found.len(), 3);
+        for p in &peers {
+            assert!(found.contains(&NodeId::from_peer(p.peer_id())));
+        }
+    }
+
+    #[test]
+    fn learning_the_same_table_twice_adds_nothing_new() {
+        let local = Identity::generate("local").unwrap();
+        let peers: Vec<Identity> = (0..2)
+            .map(|i| Identity::generate(&format!("peer{i}")).unwrap())
+            .collect();
+        let table = discovered_table(&local, &peers);
+        let mut dht = Dht::new(local.peer_id());
+        assert_eq!(dht.learn_discovered(&table), 2);
+        assert_eq!(dht.learn_discovered(&table), 0);
+        assert_eq!(dht.peer_count(), 2);
+    }
+
+    #[test]
+    fn a_record_for_the_local_peer_is_not_learned() {
+        let local = Identity::generate("local").unwrap();
+        let peer = Identity::generate("peer").unwrap();
+        let mut table = PeerTable::new();
+        table
+            .insert(PeerRecord::new(
+                &local,
+                std::net::SocketAddr::from(([127, 0, 0, 1], 7001)),
+                1_000,
+            ))
+            .expect("insert");
+        table
+            .insert(PeerRecord::new(
+                &peer,
+                std::net::SocketAddr::from(([127, 0, 0, 1], 7002)),
+                1_000,
+            ))
+            .expect("insert");
+        let mut dht = Dht::new(local.peer_id());
+        assert_eq!(dht.learn_discovered(&table), 1);
+        assert_eq!(dht.peer_count(), 1);
+        assert!(!dht.contains(local.peer_id()));
+        assert!(dht.contains(peer.peer_id()));
     }
 }

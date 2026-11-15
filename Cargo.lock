@@ -333,6 +333,7 @@ name = "kernel-dht"
 version = "0.1.0"
 dependencies = [
  "kernel-crypto",
+ "kernel-discovery",
  "kernel-identity",
 ]
 
@@ -367,6 +368,7 @@ version = "0.1.0"
 dependencies = [
  "kernel-crypto",
  "kernel-identity",
+ "kernel-identity-disk",
  "kernel-storage",
  "kernel-store-disk",
  "kernel-transport",

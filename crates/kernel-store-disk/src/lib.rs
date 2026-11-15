@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs::{create_dir_all, File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use kernel_crypto::sha256;
 use kernel_storage::Cid;
@@ -76,7 +76,6 @@ impl From<std::io::Error> for DiskError {
 #[derive(Debug)]
 pub struct DiskStore {
     file: File,
-    path: PathBuf,
     index: HashMap<Cid, (u64, u32)>,
 }
 
@@ -93,7 +92,7 @@ impl DiskStore {
             .truncate(false)
             .open(&path)?;
         let index = Self::replay(&mut file)?;
-        Ok(Self { file, path, index })
+        Ok(Self { file, index })
     }
 
     /// Replay the log, building the index. Stops at the first truncated
@@ -224,6 +223,7 @@ impl DiskStore {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
 
     fn test_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
