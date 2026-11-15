@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kernel-crypto",
+    "crates/kernel-identity",
+    "crates/kernel-storage",
+    "crates/kernel-node",
+    "crates/kernel-transport",
+    "crates/kernel-dht",
+    "crates/kernel-sync",
+    "crates/k-files",
+    "crates/kernel-replication",
+    "crates/k-talk",
+    "crates/k-photos",
+    "crates/k-docs",
+    "crates/x-shield",
+    "crates/k-chain",
+    "crates/x-koin",
+    "crates/k-pay",
+    "crates/kernel-xchange",
+    "crates/kash-korner",
+    "crates/kernelodys",
+    "crates/kernel-vision",
+    "crates/k-ai",
+    "crates/hey-ai",
+    "crates/planet-k",
+    "crates/x-koms",
+]
+
+[workspace.dependencies]
+curve25519-dalek = "4"
+ed25519-dalek = "2"
+getrandom = "0.2"
+hkdf = "0.12"
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
+zeroize = { version = "1", features = ["derive"] }

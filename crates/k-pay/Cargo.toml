@@ -1,0 +1,11 @@
+[package]
+name = "k-pay"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "K•PAY: signed invoices and receipts settled on X•Koin"
+
+[dependencies]
+kernel-crypto = { path = "../kernel-crypto" }
+kernel-identity = { path = "../kernel-identity" }
+x-koin = { path = "../x-koin" }

@@ -1,0 +1,9 @@
+[package]
+name = "kernel-identity"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Peer identity for KERNEL: human-readable names and fingerprints over Ed25519 keys"
+
+[dependencies]
+kernel-crypto = { path = "../kernel-crypto" }

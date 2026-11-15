@@ -1,0 +1,11 @@
+[package]
+name = "k-talk"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "K•Talk: signed direct messages between KERNEL peers over TCP"
+
+[dependencies]
+kernel-crypto = { path = "../kernel-crypto" }
+kernel-identity = { path = "../kernel-identity" }
+kernel-transport = { path = "../kernel-transport" }

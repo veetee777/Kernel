@@ -1,0 +1,11 @@
+[package]
+name = "kernel-vision"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Kernel•Vision: signed video on top of KERNEL content-addressed storage, with hash-verified per-chunk access"
+
+[dependencies]
+kernel-crypto = { path = "../kernel-crypto" }
+kernel-identity = { path = "../kernel-identity" }
+kernel-storage = { path = "../kernel-storage" }

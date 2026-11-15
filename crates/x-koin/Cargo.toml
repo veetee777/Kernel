@@ -1,0 +1,10 @@
+[package]
+name = "x-koin"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "X•Koin: an account-based signed coin ledger on top of KERNEL crypto and identity"
+
+[dependencies]
+kernel-crypto = { path = "../kernel-crypto" }
+kernel-identity = { path = "../kernel-identity" }

@@ -1,0 +1,13 @@
+[package]
+name = "kernel-replication"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "KERNEL distributed storage replication: copy content blocks to N peers over TCP"
+
+[dependencies]
+kernel-crypto = { path = "../kernel-crypto" }
+kernel-identity = { path = "../kernel-identity" }
+kernel-storage = { path = "../kernel-storage" }
+kernel-node = { path = "../kernel-node" }
+kernel-transport = { path = "../kernel-transport" }

@@ -1,0 +1,9 @@
+[package]
+name = "kernel-storage"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Content-addressed storage for KERNEL: SHA-256 CIDs, in-memory store, verified chunking"
+
+[dependencies]
+kernel-crypto = { path = "../kernel-crypto" }

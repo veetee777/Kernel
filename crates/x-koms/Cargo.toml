@@ -1,0 +1,11 @@
+[package]
+name = "x-koms"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "X•Kom's: the owner's personal tool — signed notes, tasks, and quick commands (commands are recorded, never executed) on KERNEL"
+
+[dependencies]
+kernel-crypto = { path = "../kernel-crypto" }
+kernel-identity = { path = "../kernel-identity" }
+kernel-storage = { path = "../kernel-storage" }

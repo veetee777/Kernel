@@ -1,0 +1,11 @@
+[package]
+name = "k-files"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "K•Files: named, signed files on top of KERNEL content-addressed storage"
+
+[dependencies]
+kernel-crypto = { path = "../kernel-crypto" }
+kernel-identity = { path = "../kernel-identity" }
+kernel-storage = { path = "../kernel-storage" }

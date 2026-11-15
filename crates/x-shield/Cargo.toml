@@ -1,0 +1,11 @@
+[package]
+name = "x-shield"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "X•Shield: node security — allow/block lists, signed attestations, rate limiting"
+
+[dependencies]
+kernel-crypto = { path = "../kernel-crypto" }
+kernel-identity = { path = "../kernel-identity" }
+kernel-node = { path = "../kernel-node" }

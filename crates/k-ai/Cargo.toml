@@ -1,0 +1,11 @@
+[package]
+name = "k-ai"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "K•AI: a signed AI task/response framework on KERNEL (providers are traits; ships a deterministic test provider, not a model)"
+
+[dependencies]
+kernel-crypto = { path = "../kernel-crypto" }
+kernel-identity = { path = "../kernel-identity" }
+kernel-storage = { path = "../kernel-storage" }
