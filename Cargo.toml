@@ -5,6 +5,9 @@ members = [
     "crates/kernel-identity",
     "crates/kernel-storage",
     "crates/kernel-node",
+    "crates/kernel-identity-disk",
+    "crates/kernel-discovery",
+    "crates/kernel-session",
     "crates/kernel-store-disk",
     "crates/kernel-transport",
     "crates/kernel-dht",
@@ -26,6 +29,7 @@ members = [
     "crates/hey-ai",
     "crates/planet-k",
     "crates/x-koms",
+    "crates/kernel-carrier",
 ]
 
 [workspace.dependencies]

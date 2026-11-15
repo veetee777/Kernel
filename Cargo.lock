@@ -302,6 +302,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernel-carrier"
+version = "0.0.0"
+dependencies = [
+ "chacha20poly1305",
+ "curve25519-dalek",
+ "ed25519-dalek",
+ "getrandom",
+ "hkdf",
+ "hmac",
+ "sha2",
+ "zeroize",
+]
+
+[[package]]
 name = "kernel-crypto"
 version = "0.1.0"
 dependencies = [
@@ -323,10 +337,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernel-discovery"
+version = "0.1.0"
+dependencies = [
+ "kernel-crypto",
+ "kernel-identity",
+ "kernel-transport",
+]
+
+[[package]]
 name = "kernel-identity"
 version = "0.1.0"
 dependencies = [
  "kernel-crypto",
+]
+
+[[package]]
+name = "kernel-identity-disk"
+version = "0.1.0"
+dependencies = [
+ "kernel-crypto",
+ "kernel-identity",
 ]
 
 [[package]]
@@ -336,6 +367,8 @@ dependencies = [
  "kernel-crypto",
  "kernel-identity",
  "kernel-storage",
+ "kernel-store-disk",
+ "kernel-transport",
 ]
 
 [[package]]
@@ -350,10 +383,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernel-session"
+version = "0.1.0"
+dependencies = [
+ "kernel-crypto",
+ "kernel-identity",
+ "kernel-transport",
+]
+
+[[package]]
 name = "kernel-storage"
 version = "0.1.0"
 dependencies = [
  "kernel-crypto",
+]
+
+[[package]]
+name = "kernel-store-disk"
+version = "0.1.0"
+dependencies = [
+ "kernel-crypto",
+ "kernel-storage",
 ]
 
 [[package]]

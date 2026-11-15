@@ -1,0 +1,11 @@
+[package]
+name = "kernel-session"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "KERNEL authenticated encrypted sessions: X25519 + ChaCha20-Poly1305 over TCP"
+
+[dependencies]
+kernel-crypto = { path = "../kernel-crypto" }
+kernel-identity = { path = "../kernel-identity" }
+kernel-transport = { path = "../kernel-transport" }

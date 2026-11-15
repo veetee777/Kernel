@@ -1,0 +1,10 @@
+[package]
+name = "kernel-identity-disk"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "KERNEL identity persistence: Ed25519 identity on disk, owner-only permissions, optional passphrase wrapping"
+
+[dependencies]
+kernel-crypto = { path = "../kernel-crypto" }
+kernel-identity = { path = "../kernel-identity" }

@@ -10,9 +10,9 @@ that code is still locked behind that account's paywall.
 
 ## What exists
 
-A Cargo workspace (`resolver = "2"`) with twenty-five crates. All compile
+A Cargo workspace (`resolver = "2"`) with twenty-nine crates. All compile
 with no warnings, and all tests pass (`cargo test` from this directory:
-245 tests, 0 failed).
+351 tests, 0 failed).
 
 **Foundation**
 - **`kernel-crypto`** — Ed25519 signing, X25519 key exchange,
@@ -61,6 +61,20 @@ with no warnings, and all tests pass (`cargo test` from this directory:
   exchanging records; highest version wins, ties broken by signature
   comparison (deterministic); bad signatures are rejected; sync is
   idempotent.
+- **`kernel-carrier`** — The carrier cell (mobile network layer),
+  Phases 0–2, recovered from the other session and completed here.
+  SIGMA handshake (Hello/Response/Confirm, pinned keys only, forward
+  secrecy), sealed sessions (XChaCha20-Poly1305, 64-entry replay
+  window, rekeying), KCAR binary framing, TCP transport with a cookie
+  challenge + proof-of-work flood guard, a pinned-peer gateway table,
+  and voice (MockCodec + jitter buffer; no real codec yet). PinSet
+  persists to a binary `KCPIN1` file (atomic save). 106 tests. Not
+  yet: real audio codec (Opus), radio trait, multi-hop routing,
+  discovery, time-based rekey trigger, identity hiding.
+- **`kernel-identity-disk`**, **`kernel-discovery`**,
+  **`kernel-session`** — Empty placeholders (one-line stubs) awaiting
+  the parallel build: identity persistence, peer discovery, and
+  authenticated encrypted sessions.
 
 **Apps (new)**
 - **`k-files` (K•Files)** — Named, signed files on chunked storage.
@@ -190,9 +204,14 @@ Android launcher project, not a Rust crate.
 
 - Real peer discovery and NAT traversal (the DHT is in-memory and has
   no network peer exchange yet; replication and talk use explicit
-  addresses, not DHT-discovered peers).
-- Persistence: no on-disk store is designed yet, by intent.
-- The carrier (mobile network) work.
+  addresses, not DHT-discovered peers). The `kernel-discovery`
+  skeleton is an empty placeholder.
+- Persistence: `kernel-store-disk` exists (append-only log, no
+  compaction yet); the node's identity is still not persisted, and
+  PinSet persistence exists only in the carrier.
+- The carrier's remaining pieces: real audio codec (Opus), radio
+  trait, multi-hop routing, discovery, time-based rekey trigger,
+  identity hiding.
 - Atomic swaps, smart contracts, identity beyond peer keys.
 - Grants, docs, or any deployment.
 
@@ -201,6 +220,9 @@ Android launcher project, not a Rust crate.
 - AGPL-3.0-or-later. See `LICENSE`.
 - No JSON-on-disk, no Postgres, no SQLite, no S3, no Supabase,
   no Railway for KERNEL storage.
+- Storage is 100% free: local files only, no paid service, no
+  per-read or per-write charges, ever. Nothing in this workspace
+  phones home to a billing meter.
 - No facial recognition.
 - Names for humans, not hashes, wherever a human sees an identifier.
 - Preserve existing work; consolidate, don't scatter partial
