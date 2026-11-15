@@ -20,7 +20,13 @@ fn main() -> ExitCode {
         }
     };
     println!("identity: {}", node.public_identity().encode());
-    let cid = node.store_local(b"hello kernel");
+    let cid = match node.store_local(b"hello kernel") {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("kernel-node: store failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     println!("stored block: {cid}");
     match node.get_local(&cid) {
         Ok(data) => {

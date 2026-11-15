@@ -6,17 +6,28 @@
 //! over TCP lives in the [`net`] module; peer discovery and NAT
 //! traversal are still future work.
 //!
+//! Persistence: [`Node::open`] keeps blocks in a binary log on disk
+//! ([`kernel_store_disk::DiskStore`]), so a node that restarts still
+//! holds what it stored. `store_local` on a persistent node returns
+//! only after the bytes are fsync'd to disk. One honest limit: the
+//! node's *identity* is not persisted yet — a restarted node gets a
+//! fresh identity (new PeerId) while its blocks survive under their
+//! content-addressed CIDs. Persisting the private key is separate
+//! work (encryption at rest, owner-only permissions).
+//!
 //! Trust rule: a node only serves blocks it actually holds, and a block
 //! is only accepted if its bytes hash to the CID that was requested.
 
 use std::collections::HashMap;
 use std::fmt;
+use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::time::Duration;
 
 use kernel_crypto::Ed25519Signature;
 use kernel_identity::{Identity, IdentityError, PeerId, PublicIdentity};
 use kernel_storage::{Cid, ContentStore, StorageError};
+use kernel_store_disk::{DiskError, DiskStore};
 
 /// Block exchange over real TCP. See [`net`] for the wire protocol.
 pub mod net;
@@ -34,6 +45,8 @@ pub enum NodeError {
     BlockNotFound(Cid),
     /// The in-process transport failed.
     Network(String),
+    /// The on-disk store failed (message only; see [`DiskError`]).
+    Disk(String),
 }
 
 impl fmt::Display for NodeError {
@@ -44,6 +57,7 @@ impl fmt::Display for NodeError {
             NodeError::PeerNotFound(peer) => write!(f, "peer not on this network: {peer}"),
             NodeError::BlockNotFound(cid) => write!(f, "peer does not hold block {cid}"),
             NodeError::Network(msg) => write!(f, "network error: {msg}"),
+            NodeError::Disk(msg) => write!(f, "disk store error: {msg}"),
         }
     }
 }
@@ -59,6 +73,12 @@ impl From<StorageError> for NodeError {
 impl From<IdentityError> for NodeError {
     fn from(e: IdentityError) -> Self {
         NodeError::Identity(e)
+    }
+}
+
+impl From<DiskError> for NodeError {
+    fn from(e: DiskError) -> Self {
+        NodeError::Disk(e.to_string())
     }
 }
 
@@ -134,15 +154,60 @@ impl Network {
 pub struct Node {
     identity: Identity,
     store: ContentStore,
+    /// Attached on-disk store, if this node persists its blocks.
+    disk: Option<DiskStore>,
 }
 
 impl Node {
     /// Create a node with a fresh identity under `display_name`.
+    /// In-memory only: blocks are lost when the node drops.
     pub fn new(display_name: &str) -> Result<Self, NodeError> {
         Ok(Self {
             identity: Identity::generate(display_name)?,
             store: ContentStore::new(),
+            disk: None,
         })
+    }
+
+    /// Open a persistent node: blocks live in a binary log under `dir`
+    /// and survive restarts. Blocks stored earlier are loaded back into
+    /// memory on open. The identity is still fresh each open — see the
+    /// module docs for that limit.
+    pub fn open(dir: &Path, display_name: &str) -> Result<Self, NodeError> {
+        let mut disk = DiskStore::open(dir)?;
+        let mut store = ContentStore::new();
+        for (_cid, bytes) in disk.all()? {
+            // Re-deriving the CID from the bytes gives the same CID
+            // (content addressing); the disk store already verified
+            // each block's hash on load.
+            store.put(&bytes);
+        }
+        Ok(Self {
+            identity: Identity::generate(display_name)?,
+            store,
+            disk: Some(disk),
+        })
+    }
+
+    /// True if this node persists its blocks to disk.
+    pub fn is_persistent(&self) -> bool {
+        self.disk.is_some()
+    }
+
+    /// Flush every in-memory block not yet on disk. A no-op for an
+    /// in-memory node. `store_local` calls this after every store, so
+    /// callers normally never need it; it exists for explicit flush
+    /// points (for example, before a clean shutdown).
+    pub fn sync_to_disk(&mut self) -> Result<(), NodeError> {
+        let Some(disk) = self.disk.as_mut() else {
+            return Ok(());
+        };
+        for (cid, bytes) in self.store.blocks() {
+            if !disk.has(&cid) {
+                disk.put(&bytes)?;
+            }
+        }
+        Ok(())
     }
 
     /// This node's public peer id.
@@ -160,15 +225,21 @@ impl Node {
         self.identity.sign(message)
     }
 
-    /// Store bytes locally, returning their CID.
-    pub fn store_local(&mut self, data: &[u8]) -> Cid {
-        self.store.put(data)
+    /// Store bytes locally, returning their CID. On a persistent node
+    /// this returns only after the bytes are fsync'd to disk.
+    pub fn store_local(&mut self, data: &[u8]) -> Result<Cid, NodeError> {
+        let cid = self.store.put(data);
+        self.sync_to_disk()?;
+        Ok(cid)
     }
 
     /// Store large content locally, split into verified chunks.
-    /// Returns the root CID of the chunk manifest.
-    pub fn store_local_chunked(&mut self, data: &[u8]) -> Cid {
-        self.store.put_chunked(data)
+    /// Returns the root CID of the chunk manifest. On a persistent node
+    /// every chunk and the manifest are fsync'd before this returns.
+    pub fn store_local_chunked(&mut self, data: &[u8]) -> Result<Cid, NodeError> {
+        let root = self.store.put_chunked(data);
+        self.sync_to_disk()?;
+        Ok(root)
     }
 
     /// Fetch bytes this node already holds.
@@ -253,7 +324,7 @@ mod tests {
     #[test]
     fn nodes_exchange_a_block() {
         let (net, mut alice, bob, a_rx) = two_nodes();
-        let cid = alice.store_local(b"hello kernel");
+        let cid = alice.store_local(b"hello kernel").unwrap();
         let alice_peer = alice.peer_id().clone();
 
         // Bob asks; Alice answers; Bob receives the bytes.
@@ -267,7 +338,7 @@ mod tests {
     #[test]
     fn fetch_block_convenience_with_threaded_peer() {
         let (net, mut alice, bob, a_rx) = two_nodes();
-        let cid = alice.store_local(b"fetch me");
+        let cid = alice.store_local(b"fetch me").unwrap();
         let alice_peer = alice.peer_id().clone();
 
         // Alice serves requests on her own thread.
@@ -350,10 +421,53 @@ mod tests {
     fn local_store_and_chunked_round_trip() {
         let mut node = Node::new("alice").unwrap();
         let data: Vec<u8> = (0..700 * 1024).map(|i| (i % 251) as u8).collect();
-        let root = node.store_local_chunked(&data);
+        let root = node.store_local_chunked(&data).unwrap();
         assert!(node.has_local(&root));
         assert_eq!(node.get_local_chunked(&root).unwrap(), data);
         assert_eq!(node.get_local(&root).unwrap().len(), 11 + 3 * 32); // manifest
+    }
+
+    fn node_test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kernel-node-{}-{}",
+            std::process::id(),
+            name
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn persistent_node_survives_restart() {
+        let dir = node_test_dir("persist");
+        let cid;
+        let root;
+        {
+            let mut node = Node::open(&dir, "alice").unwrap();
+            assert!(node.is_persistent());
+            cid = node.store_local(b"still here after restart").unwrap();
+            let data: Vec<u8> = (0..700 * 1024).map(|i| (i % 251) as u8).collect();
+            root = node.store_local_chunked(&data).unwrap();
+        }
+        // Drop and reopen: a new identity, the same blocks.
+        let mut reopened = Node::open(&dir, "alice").unwrap();
+        assert!(reopened.is_persistent());
+        assert_eq!(
+            reopened.get_local(&cid).unwrap(),
+            b"still here after restart"
+        );
+        assert_eq!(reopened.get_local_chunked(&root).unwrap().len(), 700 * 1024);
+        // Storing the same bytes again does not duplicate them on disk.
+        let cid2 = reopened.store_local(b"still here after restart").unwrap();
+        assert_eq!(cid, cid2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn in_memory_node_is_not_persistent() {
+        let mut node = Node::new("alice").unwrap();
+        assert!(!node.is_persistent());
+        assert!(node.sync_to_disk().is_ok());
     }
 
     #[test]

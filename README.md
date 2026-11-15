@@ -10,9 +10,9 @@ that code is still locked behind that account's paywall.
 
 ## What exists
 
-A Cargo workspace (`resolver = "2"`) with twenty-four crates. All compile
+A Cargo workspace (`resolver = "2"`) with twenty-five crates. All compile
 with no warnings, and all tests pass (`cargo test` from this directory:
-237 tests, 0 failed).
+245 tests, 0 failed).
 
 **Foundation**
 - **`kernel-crypto`** — Ed25519 signing, X25519 key exchange,
@@ -32,6 +32,14 @@ with no warnings, and all tests pass (`cargo test` from this directory:
   together. In-process transport (channels) lets two nodes exchange
   blocks by CID in tests. A node serves only blocks it holds, and a
   request for content it was never given returns a clean error.
+  `Node::open` persists blocks to disk (see `kernel-store-disk`);
+  `net` adds real TCP block exchange between machines.
+- **`kernel-store-disk`** — Persistent content-addressed store: one
+  append-only binary log (`blocks.klog`), `KBLK1` records, fsync per
+  put, hash-verified on open and on read. A torn final record from a
+  crash is cut on replay; earlier blocks survive. No JSON, no SQLite.
+  The node's identity is *not* persisted yet — a restarted node gets
+  a fresh PeerId while its blocks survive under their CIDs.
 
 **Networking and distribution (new)**
 - **`kernel-transport`** — Real TCP transport (std only): length-prefixed

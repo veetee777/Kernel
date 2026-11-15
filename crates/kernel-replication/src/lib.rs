@@ -139,8 +139,8 @@ impl ReplicaNode {
     }
 
     /// Store bytes locally, returning their CID.
-    pub fn store_local(&self, data: &[u8]) -> Cid {
-        self.node.lock().unwrap().store_local(data)
+    pub fn store_local(&self, data: &[u8]) -> Result<Cid, ReplicationError> {
+        Ok(self.node.lock().unwrap().store_local(data)?)
     }
 
     /// Fetch bytes this node already holds.
@@ -203,7 +203,11 @@ impl ReplicaNode {
                     if actual != *cid {
                         continue; // a lying peer: skip it, try the next
                     }
-                    self.node.lock().unwrap().store_local(&data);
+                    // Cache the fetched block locally. A disk failure
+                    // here does not fail the fetch itself — the bytes
+                    // are still returned — but this node will not hold
+                    // the block for others afterwards.
+                    let _ = self.node.lock().unwrap().store_local(&data);
                     self.record_holder(cid, holder);
                     return Ok(data);
                 }
@@ -359,7 +363,10 @@ fn handle_connection(mut conn: Connection, node: Arc<Mutex<Node>>) {
                     let _ = conn.send(&[RESP_FAIL]);
                     continue;
                 }
-                node.lock().unwrap().store_local(data);
+                // Keep a copy locally so this node can serve the block
+                // later. The peer already got its response; a disk
+                // failure here only means this node will not hold it.
+                let _ = node.lock().unwrap().store_local(data);
                 let identity = node.lock().unwrap().public_identity().encode();
                 let mut resp = vec![RESP_OK];
                 resp.extend_from_slice(identity.as_bytes());
@@ -439,7 +446,7 @@ mod tests {
         let origin = ReplicaNode::spawn("origin").unwrap();
         let peers = spawn_peers(3);
         let data = b"replicated block";
-        let cid = origin.store_local(data);
+        let cid = origin.store_local(data).unwrap();
 
         let accepted = origin.replicate(&cid, &addrs(&peers)).unwrap();
         assert_eq!(accepted.len(), 3);
@@ -463,7 +470,7 @@ mod tests {
         let origin = ReplicaNode::spawn("origin").unwrap();
         let peers = spawn_peers(3);
         let data = b"fetch me from a replica";
-        let cid = origin.store_local(data);
+        let cid = origin.store_local(data).unwrap();
         origin.replicate(&cid, &addrs(&peers)).unwrap();
 
         // A fresh node that never saw the origin fetches from replica 1.
@@ -492,7 +499,7 @@ mod tests {
         let peers = spawn_peers(2);
         let peer_addrs = addrs(&peers);
         let data = b"skip the dead, use the live";
-        let cid = origin.store_local(data);
+        let cid = origin.store_local(data).unwrap();
         origin.replicate(&cid, &peer_addrs).unwrap();
 
         // Stop peer 0, keep peer 1 live.
@@ -515,7 +522,7 @@ mod tests {
     fn replicate_to_no_reachable_peer_is_a_clean_error() {
         let origin = ReplicaNode::spawn("origin").unwrap();
         let data = b"nowhere to go";
-        let cid = origin.store_local(data);
+        let cid = origin.store_local(data).unwrap();
         // Port 1 is never listening.
         let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
         assert!(matches!(

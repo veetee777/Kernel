@@ -5,6 +5,7 @@ members = [
     "crates/kernel-identity",
     "crates/kernel-storage",
     "crates/kernel-node",
+    "crates/kernel-store-disk",
     "crates/kernel-transport",
     "crates/kernel-dht",
     "crates/kernel-sync",

@@ -1,0 +1,10 @@
+[package]
+name = "kernel-store-disk"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "KERNEL persistent content-addressed store: binary append-only log on disk, no JSON, no SQLite"
+
+[dependencies]
+kernel-crypto = { path = "../kernel-crypto" }
+kernel-storage = { path = "../kernel-storage" }

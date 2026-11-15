@@ -220,7 +220,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let mut server_node = Node::new("alice").unwrap();
-        let cid = server_node.store_local(b"hello over tcp");
+        let cid = server_node.store_local(b"hello over tcp").unwrap();
 
         // Server: one request, then done.
         let server = std::thread::spawn(move || {
@@ -293,7 +293,7 @@ mod tests {
 
         let mut server_node = Node::new("alice").unwrap();
         let data: Vec<u8> = (0..700 * 1024).map(|i| (i % 251) as u8).collect();
-        let root = server_node.store_local_chunked(&data);
+        let root = server_node.store_local_chunked(&data).unwrap();
 
         let server = std::thread::spawn(move || {
             serve_listener(&listener, &mut server_node, 1).unwrap();
