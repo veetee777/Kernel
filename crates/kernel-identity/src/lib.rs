@@ -143,6 +143,24 @@ impl Identity {
         self.secret.sign(message)
     }
 
+    /// Export the raw 32 secret bytes. Sensitive: the caller must zeroize
+    /// the returned bytes after use. This exists only so an identity can
+    /// be persisted to owner-only disk storage (see kernel-identity-disk);
+    /// nothing else should call it.
+    pub fn secret_bytes(&self) -> [u8; 32] {
+        self.secret.to_bytes()
+    }
+
+    /// Rebuild an identity from raw secret bytes and a display name. The
+    /// public key is derived from the secret, so a stored public key can
+    /// be checked against it. Inverse of [`Identity::secret_bytes`],
+    /// for loading a persisted identity.
+    pub fn from_secret_bytes(secret: &[u8; 32], display_name: &str) -> Result<Self, IdentityError> {
+        let secret = Ed25519SecretKey::from_bytes(secret);
+        let peer_id = PeerId::new(secret.public_key(), display_name)?;
+        Ok(Self { secret, peer_id })
+    }
+
     /// The shareable public half of this identity.
     pub fn public_identity(&self) -> PublicIdentity {
         PublicIdentity {

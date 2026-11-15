@@ -16,11 +16,11 @@
 //! or a tampered chunk fails loudly instead of silently returning wrong
 //! bytes.
 //!
-//! Nothing here decodes files or touches an audio device. This crate
-//! stores, verifies, and lists tracks and playlists. Playback is the
-//! [`tuning`] module: Kernelodys plays at A = 432 Hz, and
-//! [`tuning::play_432`] retunes decoded PCM to 432 before it reaches
-//! the listener.
+//! Nothing here touches an audio device. This crate stores, verifies,
+//! and lists tracks and playlists, and decodes 16-bit PCM WAV bytes
+//! held in memory (see [`wav`]). Playback is the [`tuning`] module:
+//! Kernelodys plays at A = 432 Hz, and [`tuning::play_432`] retunes
+//! decoded PCM to 432 before it reaches the listener.
 //!
 //! Manifest formats (explicit binary, no JSON):
 //! `KTRACK1` + title length (u16 LE) + title bytes + artist length
@@ -38,6 +38,10 @@ use kernel_storage::{Cid, ContentStore, StorageError};
 
 /// Playback tuning: Kernelodys plays at A = 432 Hz.
 pub mod tuning;
+
+/// WAV decoding: 16-bit PCM WAV bytes in memory, decoded and retuned
+/// to 432 Hz by [`wav::play_wav_432`].
+pub mod wav;
 
 /// Magic bytes at the start of every track manifest.
 const TRACK_MAGIC: &[u8; 7] = b"KTRACK1";

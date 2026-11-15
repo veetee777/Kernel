@@ -12,7 +12,7 @@ that code is still locked behind that account's paywall.
 
 A Cargo workspace (`resolver = "2"`) with twenty-nine crates. All compile
 with no warnings, and all tests pass (`cargo test` from this directory:
-351 tests, 0 failed).
+388 tests, 0 failed).
 
 **Foundation**
 - **`kernel-crypto`** — Ed25519 signing, X25519 key exchange,
@@ -71,10 +71,22 @@ with no warnings, and all tests pass (`cargo test` from this directory:
   persists to a binary `KCPIN1` file (atomic save). 106 tests. Not
   yet: real audio codec (Opus), radio trait, multi-hop routing,
   discovery, time-based rekey trigger, identity hiding.
-- **`kernel-identity-disk`**, **`kernel-discovery`**,
-  **`kernel-session`** — Empty placeholders (one-line stubs) awaiting
-  the parallel build: identity persistence, peer discovery, and
-  authenticated encrypted sessions.
+- **`kernel-identity-disk`** — Identity persistence: save/load an
+  Ed25519 `Identity` to a binary `KIDSK1` file, 0600 permissions,
+  atomic save, optional passphrase wrap (HKDF + ChaCha20-Poly1305).
+  Corrupt, truncated, or tampered files are refused, never silently
+  loaded. A restarted node can now keep its identity instead of
+  getting a fresh PeerId.
+- **`kernel-discovery`** — Peer discovery: signed `KPEER1` records
+  (identity, address, timestamp, signature) gossiped over TCP.
+  Bad signatures are refused and never stored; stale records never
+  replace newer ones. 3-node convergence verified over loopback TCP.
+  Not wired into the DHT yet, and records never expire.
+- **`kernel-session`** — Authenticated encrypted sessions as a thin
+  integration over the carrier: runs the carrier handshake/session
+  over a `kernel-transport` connection. No crypto duplicated here.
+  No Hello-flood protection on this layer (the carrier's own
+  transport has it; this one doesn't).
 
 **Apps (new)**
 - **`k-files` (K•Files)** — Named, signed files on chunked storage.
@@ -158,6 +170,8 @@ with no warnings, and all tests pass (`cargo test` from this directory:
   and every chunk hash; `create_playlist` refuses track CIDs this
   node does not hold; `list_tracks`/`list_playlists` sort by name.
   Nothing here plays audio — storage, verification, listing only.
+  `wav` decodes 16-bit PCM WAV (in-memory bytes) and routes it
+  through the 432 Hz retune. No audio device yet.
 - **`kernel-vision` (Kernel•Vision)** — Signed video on chunked
   storage. A video is a `KVIDEO1` manifest (title, duration, width,
   height, chunk root, owner, signature). `put_video`/`get_video`
@@ -204,11 +218,12 @@ Android launcher project, not a Rust crate.
 
 - Real peer discovery and NAT traversal (the DHT is in-memory and has
   no network peer exchange yet; replication and talk use explicit
-  addresses, not DHT-discovered peers). The `kernel-discovery`
-  skeleton is an empty placeholder.
+  addresses, not DHT-discovered peers). `kernel-discovery` finds
+  peers by direct exchange, but nothing feeds them into the DHT yet.
 - Persistence: `kernel-store-disk` exists (append-only log, no
-  compaction yet); the node's identity is still not persisted, and
-  PinSet persistence exists only in the carrier.
+  compaction yet); identity persistence exists (`kernel-identity-disk`).
+  The node's `Node::open` does not yet load a saved identity — that
+  wiring is still to do.
 - The carrier's remaining pieces: real audio codec (Opus), radio
   trait, multi-hop routing, discovery, time-based rekey trigger,
   identity hiding.

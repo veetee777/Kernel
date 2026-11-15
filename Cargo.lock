@@ -358,6 +358,7 @@ version = "0.1.0"
 dependencies = [
  "kernel-crypto",
  "kernel-identity",
+ "zeroize",
 ]
 
 [[package]]
@@ -386,8 +387,8 @@ dependencies = [
 name = "kernel-session"
 version = "0.1.0"
 dependencies = [
- "kernel-crypto",
- "kernel-identity",
+ "ed25519-dalek",
+ "kernel-carrier",
  "kernel-transport",
 ]
 

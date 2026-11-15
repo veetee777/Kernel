@@ -8,3 +8,4 @@ description = "KERNEL identity persistence: Ed25519 identity on disk, owner-only
 [dependencies]
 kernel-crypto = { path = "../kernel-crypto" }
 kernel-identity = { path = "../kernel-identity" }
+zeroize = { workspace = true }
