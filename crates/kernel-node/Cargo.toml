@@ -9,3 +9,4 @@ description = "KERNEL node: wires peer identity and content storage together wit
 kernel-crypto = { path = "../kernel-crypto" }
 kernel-identity = { path = "../kernel-identity" }
 kernel-storage = { path = "../kernel-storage" }
+kernel-transport = { path = "../kernel-transport" }

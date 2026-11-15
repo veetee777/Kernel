@@ -12,7 +12,7 @@ that code is still locked behind that account's paywall.
 
 A Cargo workspace (`resolver = "2"`) with twenty-four crates. All compile
 with no warnings, and all tests pass (`cargo test` from this directory:
-226 tests, 0 failed).
+237 tests, 0 failed).
 
 **Foundation**
 - **`kernel-crypto`** — Ed25519 signing, X25519 key exchange,

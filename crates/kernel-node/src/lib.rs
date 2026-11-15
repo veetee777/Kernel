@@ -3,7 +3,8 @@
 //! Nodes hold blocks and answer block requests from other nodes. The
 //! transport in this crate is deliberately in-process (channels), so the
 //! node logic can be tested without any real networking. Real networking
-//! (TCP, DHT, hole-punching) is a separate crate that does not exist yet.
+//! over TCP lives in the [`net`] module; peer discovery and NAT
+//! traversal are still future work.
 //!
 //! Trust rule: a node only serves blocks it actually holds, and a block
 //! is only accepted if its bytes hash to the CID that was requested.
@@ -16,6 +17,9 @@ use std::time::Duration;
 use kernel_crypto::Ed25519Signature;
 use kernel_identity::{Identity, IdentityError, PeerId, PublicIdentity};
 use kernel_storage::{Cid, ContentStore, StorageError};
+
+/// Block exchange over real TCP. See [`net`] for the wire protocol.
+pub mod net;
 
 /// Errors returned by node operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
