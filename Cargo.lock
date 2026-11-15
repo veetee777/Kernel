@@ -316,6 +316,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernel-contracts"
+version = "0.1.0"
+dependencies = [
+ "kernel-crypto",
+]
+
+[[package]]
 name = "kernel-crypto"
 version = "0.1.0"
 dependencies = [
@@ -360,6 +367,14 @@ dependencies = [
  "kernel-crypto",
  "kernel-identity",
  "zeroize",
+]
+
+[[package]]
+name = "kernel-nat"
+version = "0.1.0"
+dependencies = [
+ "kernel-crypto",
+ "kernel-identity",
 ]
 
 [[package]]
@@ -410,6 +425,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernel-swap"
+version = "0.1.0"
+dependencies = [
+ "kernel-crypto",
+ "kernel-identity",
+]
+
+[[package]]
 name = "kernel-sync"
 version = "0.1.0"
 dependencies = [
@@ -427,6 +450,16 @@ version = "0.1.0"
 dependencies = [
  "kernel-crypto",
  "kernel-identity",
+ "kernel-storage",
+]
+
+[[package]]
+name = "kernel-webui"
+version = "0.1.0"
+dependencies = [
+ "kernel-crypto",
+ "kernel-identity",
+ "kernel-node",
  "kernel-storage",
 ]
 

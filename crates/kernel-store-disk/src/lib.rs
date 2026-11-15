@@ -23,6 +23,12 @@
 //! not just in the OS page cache. Duplicate puts of the same bytes
 //! write nothing — the CID is already in the index.
 //!
+//! Over time the log can still hold duplicate records (for example,
+//! written by an older writer before dedup landed, or appended by
+//! hand). [`DiskStore::compact`] rewrites the log with exactly one
+//! record per block, crash-safely: temp file, fsync, atomic rename,
+//! directory fsync.
+//!
 //! Reads seek to the indexed offset and re-verify the hash before
 //! returning bytes, so a block that rotted on disk after open is still
 //! caught instead of silently served.
@@ -35,7 +41,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs::{create_dir_all, File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use kernel_crypto::sha256;
 use kernel_storage::Cid;
@@ -76,7 +82,19 @@ impl From<std::io::Error> for DiskError {
 #[derive(Debug)]
 pub struct DiskStore {
     file: File,
+    /// Full path of the log file, kept so [`DiskStore::compact`] can
+    /// write its sibling temp file and rename it over the log.
+    path: PathBuf,
     index: HashMap<Cid, (u64, u32)>,
+}
+
+/// What [`DiskStore::compact`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Compaction {
+    /// Records removed from the log (duplicates of a CID already held).
+    pub dropped: u64,
+    /// Bytes the log file shrank by.
+    pub bytes_saved: u64,
 }
 
 impl DiskStore {
@@ -92,7 +110,11 @@ impl DiskStore {
             .truncate(false)
             .open(&path)?;
         let index = Self::replay(&mut file)?;
-        Ok(Self { file, index })
+        Ok(Self {
+            file,
+            path: path.clone(),
+            index,
+        })
     }
 
     /// Replay the log, building the index. Stops at the first truncated
@@ -216,6 +238,114 @@ impl DiskStore {
             }
         }
         Ok(out)
+    }
+
+    /// Path of the sibling temp file compaction writes to.
+    fn tmp_path(&self) -> PathBuf {
+        let mut tmp = self.path.clone().into_os_string();
+        tmp.push(".tmp");
+        PathBuf::from(tmp)
+    }
+
+    /// Count the structurally complete records in the log, stopping at
+    /// the first truncated or corrupt record. The replay at open time
+    /// already cut any torn tail, so in normal use this counts every
+    /// record in the file; it is only a count, not a verification pass.
+    fn count_records(file: &mut File) -> Result<u64, DiskError> {
+        let file_len = file.seek(SeekFrom::End(0))?;
+        file.seek(SeekFrom::Start(0))?;
+        let mut offset: u64 = 0;
+        let mut count: u64 = 0;
+        while offset + 41 <= file_len {
+            let mut header = [0u8; 41];
+            file.read_exact(&mut header)?;
+            if &header[..5] != RECORD_MAGIC {
+                break;
+            }
+            let len = u32::from_le_bytes(header[37..41].try_into().unwrap()) as u64;
+            if offset + 41 + len > file_len {
+                break;
+            }
+            offset += 41 + len;
+            file.seek(SeekFrom::Start(offset))?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// Rewrite the log so it holds exactly one record per block in the
+    /// index — the latest bytes for each CID — and nothing else.
+    ///
+    /// Crash safety: the compacted log is written to a sibling temp
+    /// file (`blocks.klog.tmp`) and fsync'd before it is atomically
+    /// renamed over `blocks.klog`, so a crash before the rename leaves
+    /// the old log intact and a crash after it finds the new log
+    /// complete and fsync'd; the directory is fsync'd after the rename
+    /// so the rename itself survives a power loss.
+    ///
+    /// This needs exclusive access: no other reader or writer may use
+    /// this store (or the same directory) while it runs, because the
+    /// file handle and the index are swapped for the new log. Nothing
+    /// calls this automatically — the caller decides when to compact.
+    pub fn compact(&mut self) -> Result<Compaction, DiskError> {
+        let result = self.compact_inner();
+        if result.is_err() {
+            // A failed compaction must not leave a stale temp file
+            // behind for the next attempt to trip over.
+            let _ = std::fs::remove_file(self.tmp_path());
+        }
+        result
+    }
+
+    fn compact_inner(&mut self) -> Result<Compaction, DiskError> {
+        let records_before = Self::count_records(&mut self.file)?;
+        let size_before = self.file.metadata()?.len();
+        // Every block, hash-verified on read: exactly one entry per
+        // CID in the index, which is exactly what the new log holds.
+        let blocks = self.all()?;
+
+        let tmp_path = self.tmp_path();
+        let mut tmp = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        let mut new_index = HashMap::with_capacity(blocks.len());
+        let mut offset: u64 = 0;
+        for (cid, data) in &blocks {
+            let mut record = Vec::with_capacity(5 + 32 + 4 + data.len());
+            record.extend_from_slice(RECORD_MAGIC);
+            record.extend_from_slice(cid.as_bytes());
+            record.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            record.extend_from_slice(data);
+            tmp.write_all(&record)?;
+            new_index.insert(*cid, (offset, data.len() as u32));
+            offset += record.len() as u64;
+        }
+        // The new log is complete on disk before the old name moves.
+        tmp.sync_all()?;
+        drop(tmp);
+        let size_after = offset;
+
+        std::fs::rename(&tmp_path, &self.path)?;
+        // Reopen on the new log before touching the old handle: if
+        // this fails, the store keeps working on the old (unlinked)
+        // log, whose contents are a superset of the new one.
+        let mut new_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)?;
+        new_file.seek(SeekFrom::End(0))?;
+        self.file = new_file;
+        self.index = new_index;
+        // Make the rename durable.
+        let dir = self.path.parent().unwrap_or(Path::new("."));
+        File::open(dir)?.sync_all()?;
+
+        Ok(Compaction {
+            dropped: records_before.saturating_sub(blocks.len() as u64),
+            bytes_saved: size_before.saturating_sub(size_after),
+        })
     }
 }
 
@@ -341,6 +471,182 @@ mod tests {
         let missing = Cid::from_bytes(sha256(b"never stored"));
         assert_eq!(store.get(&missing).unwrap(), None);
         assert!(!store.has(&missing));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Append a well-formed record for `data` directly to the log file,
+    /// bypassing `put`'s dedup: this is how a log accumulates duplicate
+    /// records of one CID (an older writer, or a hand-appended copy).
+    fn append_raw_record(dir: &Path, data: &[u8]) {
+        let cid = Cid::from_bytes(sha256(data));
+        let mut record = Vec::with_capacity(5 + 32 + 4 + data.len());
+        record.extend_from_slice(RECORD_MAGIC);
+        record.extend_from_slice(cid.as_bytes());
+        record.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        record.extend_from_slice(data);
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(dir.join(LOG_FILE_NAME))
+            .unwrap();
+        f.write_all(&record).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    fn log_len(dir: &Path) -> u64 {
+        fs::metadata(dir.join(LOG_FILE_NAME)).unwrap().len()
+    }
+
+    #[test]
+    fn compact_drops_duplicate_records_and_keeps_every_block() {
+        let dir = test_dir("compact-dup");
+        let cid_a;
+        let cid_b;
+        let cid_c;
+        {
+            let mut store = DiskStore::open(&dir).unwrap();
+            cid_a = store.put(b"alpha block").unwrap();
+            cid_b = store.put(b"beta block").unwrap();
+            cid_c = store.put(b"gamma block").unwrap();
+        }
+        // Two extra records for CIDs already in the log.
+        append_raw_record(&dir, b"alpha block");
+        append_raw_record(&dir, b"beta block");
+        let mut store = DiskStore::open(&dir).unwrap();
+        assert_eq!(store.len(), 3);
+        let size_before = log_len(&dir);
+
+        let done = store.compact().unwrap();
+        // Two duplicate records dropped: 41+11 for alpha, 41+10 for beta.
+        assert_eq!(done.dropped, 2);
+        assert_eq!(done.bytes_saved, 52 + 51);
+        assert_eq!(log_len(&dir), size_before - 103);
+        // No temp file left behind.
+        assert!(!dir.join("blocks.klog.tmp").exists());
+        // Every block still reads back byte-identical.
+        assert_eq!(store.get(&cid_a).unwrap().unwrap(), b"alpha block");
+        assert_eq!(store.get(&cid_b).unwrap().unwrap(), b"beta block");
+        assert_eq!(store.get(&cid_c).unwrap().unwrap(), b"gamma block");
+        assert_eq!(store.len(), 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compacted_store_survives_restart() {
+        let dir = test_dir("compact-restart");
+        let cid_a;
+        let cid_b;
+        {
+            let mut store = DiskStore::open(&dir).unwrap();
+            cid_a = store.put(b"alpha block").unwrap();
+            cid_b = store.put(b"beta block").unwrap();
+        }
+        append_raw_record(&dir, b"alpha block");
+        {
+            let mut store = DiskStore::open(&dir).unwrap();
+            let done = store.compact().unwrap();
+            assert_eq!(done.dropped, 1);
+        }
+        let mut reopened = DiskStore::open(&dir).unwrap();
+        assert_eq!(reopened.len(), 2);
+        assert_eq!(reopened.get(&cid_a).unwrap().unwrap(), b"alpha block");
+        assert_eq!(reopened.get(&cid_b).unwrap().unwrap(), b"beta block");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compact_empty_store_is_a_noop() {
+        let dir = test_dir("compact-empty");
+        let mut store = DiskStore::open(&dir).unwrap();
+        assert!(store.is_empty());
+        let done = store.compact().unwrap();
+        assert_eq!(done.dropped, 0);
+        assert_eq!(done.bytes_saved, 0);
+        assert_eq!(log_len(&dir), 0);
+        assert!(store.is_empty());
+        // Still usable after: a put lands and reads back.
+        let cid = store.put(b"first after compact").unwrap();
+        assert_eq!(
+            store.get(&cid).unwrap().unwrap(),
+            b"first after compact"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compact_twice_in_a_row_drops_nothing_the_second_time() {
+        let dir = test_dir("compact-twice");
+        let cid_a;
+        {
+            let mut store = DiskStore::open(&dir).unwrap();
+            cid_a = store.put(b"alpha block").unwrap();
+            store.put(b"beta block").unwrap();
+        }
+        append_raw_record(&dir, b"alpha block");
+        let mut store = DiskStore::open(&dir).unwrap();
+        let first = store.compact().unwrap();
+        assert_eq!(first.dropped, 1);
+        let size_after_first = log_len(&dir);
+        let second = store.compact().unwrap();
+        assert_eq!(second.dropped, 0);
+        assert_eq!(second.bytes_saved, 0);
+        assert_eq!(log_len(&dir), size_after_first);
+        assert_eq!(store.get(&cid_a).unwrap().unwrap(), b"alpha block");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compact_does_not_resurrect_a_torn_tail() {
+        let dir = test_dir("compact-torn");
+        let cid_a;
+        let cid_b;
+        {
+            let mut store = DiskStore::open(&dir).unwrap();
+            cid_a = store.put(b"first block").unwrap();
+            cid_b = store.put(b"second block").unwrap();
+        }
+        {
+            let mut f = OpenOptions::new()
+                .append(true)
+                .open(dir.join(LOG_FILE_NAME))
+                .unwrap();
+            f.write_all(b"KBLK1\x00\x01\x02").unwrap();
+            f.sync_all().unwrap();
+        }
+        // Reopen cuts the torn tail (replay); compact then sees a clean log.
+        let mut store = DiskStore::open(&dir).unwrap();
+        assert_eq!(store.len(), 2);
+        let done = store.compact().unwrap();
+        assert_eq!(done.dropped, 0);
+        assert_eq!(done.bytes_saved, 0);
+        assert_eq!(store.get(&cid_a).unwrap().unwrap(), b"first block");
+        assert_eq!(store.get(&cid_b).unwrap().unwrap(), b"second block");
+        // And a restart still shows exactly the two good blocks.
+        drop(store);
+        let mut reopened = DiskStore::open(&dir).unwrap();
+        assert_eq!(reopened.len(), 2);
+        assert_eq!(reopened.get(&cid_b).unwrap().unwrap(), b"second block");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn puts_after_compact_survive_a_restart() {
+        let dir = test_dir("compact-puts");
+        let cid_a;
+        let cid_b;
+        let cid_c;
+        {
+            let mut store = DiskStore::open(&dir).unwrap();
+            cid_a = store.put(b"alpha block").unwrap();
+            cid_b = store.put(b"beta block").unwrap();
+            let done = store.compact().unwrap();
+            assert_eq!(done.dropped, 0);
+            cid_c = store.put(b"gamma block").unwrap();
+        }
+        let mut reopened = DiskStore::open(&dir).unwrap();
+        assert_eq!(reopened.len(), 3);
+        assert_eq!(reopened.get(&cid_a).unwrap().unwrap(), b"alpha block");
+        assert_eq!(reopened.get(&cid_b).unwrap().unwrap(), b"beta block");
+        assert_eq!(reopened.get(&cid_c).unwrap().unwrap(), b"gamma block");
         let _ = fs::remove_dir_all(&dir);
     }
 }

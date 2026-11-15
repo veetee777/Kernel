@@ -1,0 +1,784 @@
+//! A std-only HTTP status page and JSON API for a KERNEL node.
+//!
+//! No HTTP framework, no TLS, no auth: raw [`std::net::TcpListener`],
+//! the request line and headers parsed by hand, responses written by
+//! hand. The server answers one connection at a time on its own thread
+//! and always closes the connection after the response
+//! (HTTP/1.0-style: `Connection: close`, no keep-alive).
+//!
+//! Routes:
+//! - `GET /` — status HTML page (peer id, block count, held CIDs,
+//!   persistent/identity status).
+//! - `GET /api/status` — `{"peer_id": "...", "blocks": N, "persistent": bool}`
+//! - `GET /api/blocks` — `{"blocks": ["<hex>", ...]}` (hex CIDs)
+//! - `POST /api/store` — body is raw bytes; returns `{"cid": "<hex>"}`.
+//!   Empty body is 400, a body over 1 MiB is 413.
+//! - `GET /api/fetch?cid=<hex>` — the block bytes, or 404 if not held,
+//!   400 for a malformed CID.
+//!
+//! Honest limits: no TLS and no authentication — anyone who can reach
+//! the port can read every block and store new ones. This is a status
+//! page and a small API, not a full app console, and there are no live
+//! updates (no WebSocket, no polling endpoint). Bind it to loopback
+//! unless you know what you are exposing.
+
+use std::io::{ErrorKind, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use kernel_node::Node;
+use kernel_storage::Cid;
+
+/// Largest request body the server accepts: 1 MiB.
+pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+/// Largest request head (request line + headers) the server reads.
+const MAX_HEAD_BYTES: usize = 64 * 1024;
+/// How many held CIDs the HTML status page lists.
+const PAGE_CID_LIMIT: usize = 10;
+/// Per-connection read/write timeout, so a stalled client cannot hang
+/// the server thread forever.
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// An HTTP response: status, reason phrase, content type, body.
+struct Response {
+    status: u16,
+    reason: &'static str,
+    content_type: &'static str,
+    body: Vec<u8>,
+}
+
+impl Response {
+    fn new(status: u16, reason: &'static str, content_type: &'static str, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            reason,
+            content_type,
+            body,
+        }
+    }
+
+    fn json(status: u16, reason: &'static str, body: String) -> Self {
+        Self::new(status, reason, "application/json", body.into_bytes())
+    }
+
+    fn error(status: u16, reason: &'static str, message: &str) -> Self {
+        Self::json(
+            status,
+            reason,
+            format!("{{\"error\":\"{}\"}}", json_escape(message)),
+        )
+    }
+
+    fn ok_json(body: String) -> Self {
+        Self::json(200, "OK", body)
+    }
+
+    fn ok_html(body: String) -> Self {
+        Self::new(200, "OK", "text/html; charset=utf-8", body.into_bytes())
+    }
+
+    fn ok_bytes(body: Vec<u8>) -> Self {
+        Self::new(200, "OK", "application/octet-stream", body)
+    }
+}
+
+/// A parsed HTTP request: method, target, headers, body.
+struct Request {
+    method: String,
+    target: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl Request {
+    /// First header value for `name` (case-insensitive), if any.
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The path part of the target, without any query string.
+    fn path(&self) -> &str {
+        self.target.split('?').next().unwrap_or(&self.target)
+    }
+
+    /// The query string of the target, if any.
+    fn query(&self) -> Option<&str> {
+        self.target.split_once('?').map(|(_, q)| q)
+    }
+
+    /// A query parameter by name, percent-decoded, if present.
+    fn query_param(&self, name: &str) -> Option<String> {
+        let query = self.query()?;
+        for pair in query.split('&') {
+            let (k, v) = match pair.split_once('=') {
+                Some((k, v)) => (k, v),
+                None => (pair, ""),
+            };
+            if k == name {
+                return Some(String::from_utf8_lossy(&percent_decode(v)).into_owned());
+            }
+        }
+        None
+    }
+}
+
+/// What went wrong reading a request. `Gone` means the client went
+/// away before sending anything (nothing to answer); every other
+/// variant maps to a 400 or 413 response.
+enum ReadFailure {
+    Gone,
+    BadRequest,
+    TooLarge,
+}
+
+/// The running server: a thread accepting connections on `addr`.
+pub struct WebUi {
+    addr: SocketAddr,
+    stop_flag: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl WebUi {
+    /// Start serving `node` on `bind` (use port 0 for an OS-assigned
+    /// port; see [`WebUi::addr`]). The node is shared behind a mutex:
+    /// every request locks it briefly. Returns an error if the bind
+    /// fails; nothing is started in that case.
+    pub fn start(node: Arc<Mutex<Node>>, bind: SocketAddr) -> std::io::Result<Self> {
+        let listener = TcpListener::bind(bind)?;
+        let addr = listener.local_addr()?;
+        listener.set_nonblocking(true)?;
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop_flag);
+        let handle = thread::spawn(move || serve(listener, node, flag));
+        Ok(Self {
+            addr,
+            stop_flag,
+            handle: Some(handle),
+        })
+    }
+
+    /// The address the server is actually listening on.
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Stop accepting and wait for the server thread to finish. Safe
+    /// to call more than once; after it returns, the port is closed.
+    pub fn stop(&mut self) {
+        self.stop_flag.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for WebUi {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Accept loop: poll the non-blocking listener so `stop()` can end it
+/// promptly. Connections are handled one at a time, inline.
+fn serve(listener: TcpListener, node: Arc<Mutex<Node>>, stop_flag: Arc<AtomicBool>) {
+    loop {
+        if stop_flag.load(Ordering::SeqCst) {
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => handle_connection(stream, Arc::clone(&node)),
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => thread::sleep(Duration::from_millis(5)),
+        }
+    }
+}
+
+/// One connection: read the request, route it, write the response,
+/// close. Never panics on bad input; a client that went away just
+/// ends the connection.
+fn handle_connection(mut stream: TcpStream, node: Arc<Mutex<Node>>) {
+    let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+    let response = match read_request(&mut stream) {
+        Ok(request) => route(&request, &node),
+        Err(ReadFailure::Gone) => return,
+        Err(ReadFailure::BadRequest) => {
+            Response::error(400, "Bad Request", "malformed HTTP request")
+        }
+        Err(ReadFailure::TooLarge) => {
+            Response::error(413, "Payload Too Large", "request body too large")
+        }
+    };
+    write_response(&mut stream, &response);
+}
+
+/// Read one request from `stream`: head up to the blank line, then the
+/// body per Content-Length. The connection is closed after the
+/// response either way, so no keep-alive bookkeeping is needed.
+fn read_request(stream: &mut TcpStream) -> Result<Request, ReadFailure> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let head_end;
+    loop {
+        if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+            head_end = pos + 4;
+            break;
+        }
+        if buf.len() > MAX_HEAD_BYTES {
+            return Err(ReadFailure::BadRequest);
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => {
+                return Err(if buf.is_empty() {
+                    ReadFailure::Gone
+                } else {
+                    ReadFailure::BadRequest
+                })
+            }
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                return Err(ReadFailure::Gone)
+            }
+            Err(_) => return Err(ReadFailure::BadRequest),
+        }
+    }
+    let head = String::from_utf8(buf[..head_end].to_vec()).map_err(|_| ReadFailure::BadRequest)?;
+    let mut lines = head.split("\r\n");
+    let request_line = lines.next().unwrap_or("");
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().ok_or(ReadFailure::BadRequest)?;
+    let target = parts.next().ok_or(ReadFailure::BadRequest)?;
+    let version = parts.next().ok_or(ReadFailure::BadRequest)?;
+    if parts.next().is_some() {
+        return Err(ReadFailure::BadRequest);
+    }
+    if !method.bytes().all(|b| b.is_ascii_alphabetic()) || method.is_empty() {
+        return Err(ReadFailure::BadRequest);
+    }
+    if version != "HTTP/1.0" && version != "HTTP/1.1" {
+        return Err(ReadFailure::BadRequest);
+    }
+    if !target.starts_with('/') {
+        return Err(ReadFailure::BadRequest);
+    }
+    let mut headers = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let (name, value) = line.split_once(':').ok_or(ReadFailure::BadRequest)?;
+        headers.push((name.trim().to_string(), value.trim().to_string()));
+    }
+    // Content-Length decides the body. A declared body over the limit
+    // is refused before a single body byte is read.
+    let mut request = Request {
+        method: method.to_string(),
+        target: target.to_string(),
+        headers,
+        body: Vec::new(),
+    };
+    let content_length = match request.header("Content-Length") {
+        Some(v) => v.parse::<usize>().map_err(|_| ReadFailure::BadRequest)?,
+        None => 0,
+    };
+    if content_length > MAX_BODY_BYTES {
+        return Err(ReadFailure::TooLarge);
+    }
+    while buf.len() - head_end < content_length {
+        match stream.read(&mut chunk) {
+            Ok(0) => return Err(ReadFailure::BadRequest),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                return Err(ReadFailure::BadRequest)
+            }
+            Err(_) => return Err(ReadFailure::BadRequest),
+        }
+    }
+    request.body = buf[head_end..head_end + content_length].to_vec();
+    Ok(request)
+}
+
+/// Route one parsed request. Unknown methods are 405, unknown paths
+/// 404, a known path with the wrong method 405.
+fn route(request: &Request, node: &Arc<Mutex<Node>>) -> Response {
+    let path = request.path();
+    let known_path = matches!(
+        path,
+        "/" | "/api/status" | "/api/blocks" | "/api/store" | "/api/fetch"
+    );
+    match (request.method.as_str(), path) {
+        ("GET", "/") => status_page(node),
+        ("GET", "/api/status") => api_status(node),
+        ("GET", "/api/blocks") => api_blocks(node),
+        ("POST", "/api/store") => api_store(request, node),
+        ("GET", "/api/fetch") => api_fetch(request, node),
+        (method, _) if method == "GET" || method == "POST" => {
+            if known_path {
+                Response::error(
+                    405,
+                    "Method Not Allowed",
+                    "method not allowed for this path",
+                )
+            } else {
+                Response::error(404, "Not Found", "unknown path")
+            }
+        }
+        _ => Response::error(405, "Method Not Allowed", "unknown method"),
+    }
+}
+
+/// `GET /`: the status page.
+fn status_page(node: &Arc<Mutex<Node>>) -> Response {
+    let guard = match node.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let peer_id = guard.peer_id().to_string();
+    let cids = guard.list_cids();
+    let persistent = guard.is_persistent();
+    let shown = cids.len().min(PAGE_CID_LIMIT);
+    let mut list = String::new();
+    if cids.is_empty() {
+        list.push_str("<p>No blocks held yet.</p>");
+    } else {
+        list.push_str("<ul>\n");
+        for cid in cids.iter().take(PAGE_CID_LIMIT) {
+            let hex = cid.to_hex();
+            list.push_str(&format!(
+                "<li><a href=\"/api/fetch?cid={}\">{}</a></li>\n",
+                hex,
+                html_escape(&hex)
+            ));
+        }
+        list.push_str("</ul>\n");
+        if cids.len() > shown {
+            list.push_str(&format!(
+                "<p>Showing {} of {} blocks.</p>\n",
+                shown,
+                cids.len()
+            ));
+        }
+    }
+    let identity_status = if persistent {
+        "persisted (identity.kid, owner-only)"
+    } else {
+        "in-memory only"
+    };
+    let body = format!(
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>KERNEL node</title>\n</head>\n<body>\n<h1>KERNEL node</h1>\n<table>\n<tr><th>Peer ID</th><td>{}</td></tr>\n<tr><th>Blocks held</th><td>{}</td></tr>\n<tr><th>Persistent</th><td>{}</td></tr>\n<tr><th>Identity</th><td>{}</td></tr>\n</table>\n<h2>Blocks</h2>\n{}\n</body>\n</html>\n",
+        html_escape(&peer_id),
+        cids.len(),
+        if persistent { "yes" } else { "no" },
+        identity_status,
+        list
+    );
+    Response::ok_html(body)
+}
+
+/// `GET /api/status`.
+fn api_status(node: &Arc<Mutex<Node>>) -> Response {
+    let guard = match node.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let body = format!(
+        "{{\"peer_id\":\"{}\",\"blocks\":{},\"persistent\":{}}}",
+        json_escape(&guard.peer_id().to_string()),
+        guard.list_cids().len(),
+        guard.is_persistent()
+    );
+    Response::ok_json(body)
+}
+
+/// `GET /api/blocks`.
+fn api_blocks(node: &Arc<Mutex<Node>>) -> Response {
+    let guard = match node.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let mut body = String::from("{\"blocks\":[");
+    for (i, cid) in guard.list_cids().iter().enumerate() {
+        if i > 0 {
+            body.push(',');
+        }
+        body.push_str(&format!("\"{}\"", cid.to_hex()));
+    }
+    body.push_str("]}");
+    Response::ok_json(body)
+}
+
+/// `POST /api/store`: the body is raw bytes, the response is the CID.
+fn api_store(request: &Request, node: &Arc<Mutex<Node>>) -> Response {
+    if request.body.is_empty() {
+        return Response::error(400, "Bad Request", "empty body");
+    }
+    let mut guard = match node.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match guard.store_local(&request.body) {
+        Ok(cid) => Response::ok_json(format!("{{\"cid\":\"{}\"}}", cid.to_hex())),
+        Err(e) => Response::error(500, "Internal Server Error", &e.to_string()),
+    }
+}
+
+/// `GET /api/fetch?cid=<hex>`.
+fn api_fetch(request: &Request, node: &Arc<Mutex<Node>>) -> Response {
+    let cid_hex = match request.query_param("cid") {
+        Some(v) => v,
+        None => return Response::error(400, "Bad Request", "missing cid parameter"),
+    };
+    let cid = match Cid::from_hex(&cid_hex) {
+        Ok(cid) => cid,
+        Err(_) => return Response::error(400, "Bad Request", "malformed cid"),
+    };
+    let guard = match node.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match guard.get_local(&cid) {
+        Ok(bytes) => Response::ok_bytes(bytes),
+        Err(_) => Response::error(404, "Not Found", "block not held"),
+    }
+}
+
+/// Write one response, then the caller closes the connection.
+fn write_response(stream: &mut TcpStream, response: &Response) {
+    let head = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        response.status,
+        response.reason,
+        response.content_type,
+        response.body.len()
+    );
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(&response.body);
+    let _ = stream.flush();
+}
+
+/// First index of `needle` in `haystack`, if present.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Percent-decode a query value (`%XX` sequences only; `+` is kept).
+fn percent_decode(s: &str) -> Vec<u8> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Escape a string for inclusion in HTML text.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Escape a string for inclusion in a JSON string literal.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Tests: every route exercised over real loopback TCP with raw requests.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A running server on an OS-assigned loopback port, plus its node.
+    fn start_ui() -> (WebUi, SocketAddr, Arc<Mutex<Node>>) {
+        let node = Arc::new(Mutex::new(Node::new("testnode").unwrap()));
+        let ui = WebUi::start(Arc::clone(&node), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = ui.addr();
+        assert_ne!(addr.port(), 0);
+        (ui, addr, node)
+    }
+
+    /// Send raw request bytes, read the whole response until close.
+    /// Returns raw bytes: binary bodies (e.g. fetched blocks) must not
+    /// be lossy-decoded into a String.
+    fn raw(addr: SocketAddr, request: &[u8]) -> Vec<u8> {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(request).unwrap();
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).unwrap();
+        out
+    }
+
+    /// `raw` for text responses.
+    fn raw_str(addr: SocketAddr, request: &[u8]) -> String {
+        String::from_utf8_lossy(&raw(addr, request)).into_owned()
+    }
+
+    fn get(addr: SocketAddr, path: &str) -> String {
+        raw_str(
+            addr,
+            format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+    }
+
+    fn post(addr: SocketAddr, path: &str, body: &[u8]) -> String {
+        let mut req = format!(
+            "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        req.extend_from_slice(body);
+        raw_str(addr, &req)
+    }
+
+    /// Split a response into (status line, body).
+    fn split(response: &str) -> (&str, &str) {
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        (head.lines().next().unwrap(), body)
+    }
+
+    fn status_code(response: &str) -> u16 {
+        split(response)
+            .0
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn status_page_shows_peer_id_and_counts() {
+        let (mut ui, addr, node) = start_ui();
+        {
+            let mut n = node.lock().unwrap();
+            n.store_local(b"hello").unwrap();
+        }
+        let resp = get(addr, "/");
+        assert_eq!(status_code(&resp), 200);
+        let (_, body) = split(&resp);
+        assert!(resp.contains("Content-Type: text/html"));
+        assert!(body.contains("testnode"));
+        assert!(body.contains("Blocks held"));
+        assert!(body.contains("<td>1</td>"));
+        assert!(body.contains("Persistent"));
+        assert!(body.contains("in-memory only"));
+        ui.stop();
+    }
+
+    #[test]
+    fn api_status_json() {
+        let (mut ui, addr, node) = start_ui();
+        {
+            let mut n = node.lock().unwrap();
+            n.store_local(b"one").unwrap();
+            n.store_local(b"two").unwrap();
+        }
+        let resp = get(addr, "/api/status");
+        assert_eq!(status_code(&resp), 200);
+        let (_, body) = split(&resp);
+        assert!(body.contains("\"peer_id\":\"testnode"), "body: {body}");
+        assert!(body.contains("\"blocks\":2"), "body: {body}");
+        assert!(body.contains("\"persistent\":false"), "body: {body}");
+        ui.stop();
+    }
+
+    #[test]
+    fn api_blocks_lists_held_cids() {
+        let (mut ui, addr, node) = start_ui();
+        let cid;
+        {
+            let mut n = node.lock().unwrap();
+            cid = n.store_local(b"listed").unwrap();
+        }
+        let resp = get(addr, "/api/blocks");
+        assert_eq!(status_code(&resp), 200);
+        let (_, body) = split(&resp);
+        assert!(body.contains(&cid.to_hex()), "body: {body}");
+        ui.stop();
+    }
+
+    #[test]
+    fn post_store_then_fetch_round_trips_exact_bytes() {
+        let (mut ui, addr, _node) = start_ui();
+        let bytes: Vec<u8> = (0..=255).collect();
+        let stored = post(addr, "/api/store", &bytes);
+        assert_eq!(status_code(&stored), 200);
+        let (_, stored_body) = split(&stored);
+        let cid_hex = stored_body
+            .strip_prefix("{\"cid\":\"")
+            .and_then(|s| s.strip_suffix("\"}"))
+            .expect("cid json");
+        assert_eq!(cid_hex.len(), 64);
+        let fetched = raw(
+            addr,
+            format!(
+                "GET /api/fetch?cid={cid_hex} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        let fetched_str = String::from_utf8_lossy(&fetched);
+        assert_eq!(status_code(&fetched_str), 200);
+        // Split the raw bytes at the header/body boundary; the body
+        // must be the exact stored bytes (binary-safe).
+        let sep = fetched
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("header/body separator");
+        assert_eq!(&fetched[sep + 4..], bytes.as_slice());
+        ui.stop();
+    }
+
+    #[test]
+    fn fetch_unknown_cid_is_404() {
+        let (mut ui, addr, _node) = start_ui();
+        let missing = Cid::from_bytes(kernel_crypto::sha256(b"never stored"));
+        let resp = get(addr, &format!("/api/fetch?cid={}", missing.to_hex()));
+        assert_eq!(status_code(&resp), 404);
+        ui.stop();
+    }
+
+    #[test]
+    fn fetch_malformed_cid_is_400() {
+        let (mut ui, addr, _node) = start_ui();
+        assert_eq!(status_code(&get(addr, "/api/fetch?cid=xyz")), 400);
+        assert_eq!(status_code(&get(addr, "/api/fetch?cid=")), 400);
+        assert_eq!(status_code(&get(addr, "/api/fetch")), 400);
+        ui.stop();
+    }
+
+    #[test]
+    fn empty_post_body_is_400() {
+        let (mut ui, addr, _node) = start_ui();
+        assert_eq!(status_code(&post(addr, "/api/store", b"")), 400);
+        ui.stop();
+    }
+
+    #[test]
+    fn oversize_post_body_is_413() {
+        let (mut ui, addr, _node) = start_ui();
+        // Claim more than 1 MiB; the server refuses before reading it.
+        let req = format!(
+            "POST /api/store HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            MAX_BODY_BYTES + 1
+        );
+        let resp = raw_str(addr, req.as_bytes());
+        assert_eq!(status_code(&resp), 413);
+        ui.stop();
+    }
+
+    #[test]
+    fn unknown_path_is_404() {
+        let (mut ui, addr, _node) = start_ui();
+        assert_eq!(status_code(&get(addr, "/nope")), 404);
+        ui.stop();
+    }
+
+    #[test]
+    fn garbage_request_gets_400_and_closes() {
+        let (mut ui, addr, _node) = start_ui();
+        let resp = raw_str(addr, b"garbage\r\n\r\n");
+        assert_eq!(status_code(&resp), 400);
+        // read_to_end in raw() returned, so the connection closed.
+        assert_eq!(status_code(&raw_str(addr, b"!!!\r\n\r\n")), 400);
+        ui.stop();
+    }
+
+    #[test]
+    fn wrong_method_is_405() {
+        let (mut ui, addr, _node) = start_ui();
+        assert_eq!(
+            status_code(&raw_str(
+                addr,
+                b"DELETE / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+            )),
+            405
+        );
+        assert_eq!(status_code(&post(addr, "/api/status", b"x")), 405);
+        assert_eq!(status_code(&get(addr, "/api/store")), 405);
+        ui.stop();
+    }
+
+    #[test]
+    fn server_stops_cleanly() {
+        let (mut ui, addr, _node) = start_ui();
+        // Works while running.
+        assert_eq!(status_code(&get(addr, "/api/status")), 200);
+        ui.stop();
+        // Port is closed after stop.
+        assert!(TcpStream::connect(addr).is_err());
+    }
+
+    #[test]
+    fn persistent_node_reports_persistent() {
+        let dir = std::env::temp_dir().join(format!("kernel-webui-{}-persist", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let node = Arc::new(Mutex::new(Node::open(&dir, "persistnode").unwrap()));
+        let mut ui = WebUi::start(Arc::clone(&node), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = ui.addr();
+        let resp = get(addr, "/api/status");
+        assert_eq!(status_code(&resp), 200);
+        let (_, body) = split(&resp);
+        assert!(body.contains("\"persistent\":true"), "body: {body}");
+        let page = get(addr, "/");
+        assert!(page.contains("identity.kid"));
+        ui.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

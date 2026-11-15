@@ -18,9 +18,12 @@
 //!
 //! Nothing here touches an audio device. This crate stores, verifies,
 //! and lists tracks and playlists, and decodes 16-bit PCM WAV bytes
-//! held in memory (see [`wav`]). Playback is the [`tuning`] module:
-//! Kernelodys plays at A = 432 Hz, and [`tuning::play_432`] retunes
-//! decoded PCM to 432 before it reaches the listener.
+//! held in memory (see [`wav`]). Playback is the [`tuning`] module
+//! plus the [`playback`] engine: Kernelodys plays at A = 432 Hz, and
+//! [`tuning::play_432`] retunes decoded PCM to 432 before the engine
+//! streams it to a sink in fixed-size chunks. [`playback::WavFileSink`]
+//! renders a track to a real `.wav` file on disk; a device sink
+//! (ALSA, AAudio) is future work, not this build.
 //!
 //! Manifest formats (explicit binary, no JSON):
 //! `KTRACK1` + title length (u16 LE) + title bytes + artist length
@@ -42,6 +45,11 @@ pub mod tuning;
 /// WAV decoding: 16-bit PCM WAV bytes in memory, decoded and retuned
 /// to 432 Hz by [`wav::play_wav_432`].
 pub mod wav;
+
+/// Real playback: a sample-accurate engine that streams retuned audio
+/// to a sink in fixed-size chunks, with pause/resume/stop and underrun
+/// counting. See [`playback::PlaybackEngine`].
+pub mod playback;
 
 /// Magic bytes at the start of every track manifest.
 const TRACK_MAGIC: &[u8; 7] = b"KTRACK1";
@@ -474,6 +482,12 @@ pub struct TrackStore {
     tracks: HashMap<Cid, TrackManifest>,
     /// Playlists this node holds, by record CID.
     playlists: HashMap<Cid, Playlist>,
+}
+
+impl Default for TrackStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TrackStore {

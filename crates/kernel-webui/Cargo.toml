@@ -1,0 +1,12 @@
+[package]
+name = "kernel-webui"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "KERNEL node web UI: std-only HTTP status page and JSON API over a node"
+
+[dependencies]
+kernel-crypto = { path = "../kernel-crypto" }
+kernel-identity = { path = "../kernel-identity" }
+kernel-node = { path = "../kernel-node" }
+kernel-storage = { path = "../kernel-storage" }

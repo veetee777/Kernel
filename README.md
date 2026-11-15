@@ -10,9 +10,9 @@ that code is still locked behind that account's paywall.
 
 ## What exists
 
-A Cargo workspace (`resolver = "2"`) with twenty-nine crates. All compile
+A Cargo workspace (`resolver = "2"`) with thirty-three crates. All compile
 with no warnings, and all tests pass (`cargo test` from this directory:
-393 tests, 0 failed).
+515 tests, 0 failed).
 
 **Foundation**
 - **`kernel-crypto`** — Ed25519 signing, X25519 key exchange,
@@ -40,8 +40,9 @@ with no warnings, and all tests pass (`cargo test` from this directory:
   append-only binary log (`blocks.klog`), `KBLK1` records, fsync per
   put, hash-verified on open and on read. A torn final record from a
   crash is cut on replay; earlier blocks survive. No JSON, no SQLite.
-  The node's identity is *not* persisted yet — a restarted node gets
-  a fresh PeerId while its blocks survive under their CIDs.
+  `DiskStore::compact()` rewrites the log to one record per CID
+  (atomic temp-file + rename + fsync, crash-safe); nothing calls it
+  automatically yet.
 
 **Networking and distribution (new)**
 - **`kernel-transport`** — Real TCP transport (std only): length-prefixed
@@ -84,12 +85,33 @@ with no warnings, and all tests pass (`cargo test` from this directory:
   (identity, address, timestamp, signature) gossiped over TCP.
   Bad signatures are refused and never stored; stale records never
   replace newer ones. 3-node convergence verified over loopback TCP.
-  Not wired into the DHT yet, and records never expire.
+  Feeds into the DHT via `Dht::learn_discovered`; records never
+  expire.
 - **`kernel-session`** — Authenticated encrypted sessions as a thin
   integration over the carrier: runs the carrier handshake/session
   over a `kernel-transport` connection. No crypto duplicated here.
   No Hello-flood protection on this layer (the carrier's own
   transport has it; this one doesn't).
+- **`kernel-nat`** — NAT traversal: minimal STUN (RFC 5389 binding
+  request/response, XOR-MAPPED-ADDRESS), UDP hole punching with a
+  rendezvous registry, and a relay fallback for peers that cannot
+  punch through. Address learning classifies the NAT (full cone /
+  restricted / symmetric). All send paths use connected UDP sockets.
+  Loopback-tested only — a real NAT crossing is still unproven.
+- **`kernel-swap`** — Atomic swaps: hash-time-locked contracts
+  (HTLC) over a local in-memory ledger. Lock / claim with preimage /
+  refund after timeout, with funds conserved exactly in every path;
+  a two-party cross-ledger swap flow is tested. No real
+  Bitcoin/Ethereum interop — no chain client, no on-chain finality.
+- **`kernel-contracts`** — Smart contracts: a deterministic
+  stack-based bytecode VM (12 opcodes) with gas metering, isolated
+  per-contract storage, deploy-time validation, and atomic calls
+  (writes commit only on HALT). No WASM/EVM, no cross-contract
+  calls, no on-disk state.
+- **`kernel-webui`** — Node web UI: std-only HTTP server. `GET /`
+  status page, `GET /api/status`, `GET /api/blocks`,
+  `POST /api/store`, `GET /api/fetch?cid=...`. No TLS, no auth —
+  bind it to loopback unless the exposure is understood.
 
 **Apps (new)**
 - **`k-files` (K•Files)** — Named, signed files on chunked storage.
@@ -172,16 +194,22 @@ with no warnings, and all tests pass (`cargo test` from this directory:
   signature). `put_track`/`get_track` verify the manifest signature
   and every chunk hash; `create_playlist` refuses track CIDs this
   node does not hold; `list_tracks`/`list_playlists` sort by name.
-  Nothing here plays audio — storage, verification, listing only.
-  `wav` decodes 16-bit PCM WAV (in-memory bytes) and routes it
-  through the 432 Hz retune. No audio device yet.
+  `playback` is a real engine: decodes 16-bit PCM WAV, retunes to
+  432 Hz, streams in chunks with a sample clock and underrun
+  counting, and writes to an `AudioSink` — a `WavFileSink` is
+  included, so playback is proven end-to-end to a file. No audio
+  device sink yet (no ALSA/AAudio backend).
 - **`kernel-vision` (Kernel•Vision)** — Signed video on chunked
   storage. A video is a `KVIDEO1` manifest (title, duration, width,
   height, chunk root, owner, signature). `put_video`/`get_video`
   verify the manifest signature and every chunk hash;
   `get_chunk` returns one hash-verified chunk by index, so a player
   can fetch the chunk it needs without reassembling the whole video.
-  Nothing here decodes or plays video.
+  `playback` is a real frame pipeline: `KVFR` raw YUV420 streams
+  decode, convert to RGB24 (BT.601), scale in software, and present
+  on a frame clock to a `FrameSink` — a `PpmSink` is included, so
+  playback is proven end-to-end to files. No compressed codec
+  (H.264/AV1/VP9), no display sink, no audio sync.
 - **`k-ai` (K•AI)** — An AI task/response **framework, not a model**.
   A task is a signed `KAITSK1` record (id, owner, prompt, signature);
   a provider is a trait (`name`, `run`); a response is a signed
@@ -219,18 +247,22 @@ Android launcher project, not a Rust crate.
 
 ## What does NOT exist yet
 
-- Real peer discovery and NAT traversal (the DHT is in-memory and has
-  no network peer exchange yet; replication and talk use explicit
-  addresses, not DHT-discovered peers). `kernel-discovery` finds
-  peers by direct exchange and `Dht::learn_discovered` feeds them
-  into the routing table; NAT traversal is still missing.
-- Persistence: `kernel-store-disk` exists (append-only log, no
-  compaction yet); identity persistence exists and `Node::open`
-  loads it. Still to do: store-disk compaction.
+- NAT traversal exists (`kernel-nat`: STUN, hole punching, relay)
+  but is loopback-tested only — no public STUN server, no public
+  rendezvous, no real-network crossing proven. The DHT is in-memory;
+  replication and talk use explicit addresses, not DHT-discovered
+  peers, except through `Dht::learn_discovered`.
+- Persistence: `kernel-store-disk` exists (append-only log +
+  `compact()`); identity persistence exists and `Node::open`
+  loads it. Still to do: an automatic compaction trigger.
 - The carrier's remaining pieces: real audio codec (Opus), radio
-  trait, multi-hop routing, discovery, time-based rekey trigger,
-  identity hiding.
-- Atomic swaps, smart contracts, identity beyond peer keys.
+  trait, multi-hop routing, time-based rekey trigger, identity
+  hiding.
+- Atomic swaps are HTLC over a local ledger — no real chain
+  interop. Smart contracts are a small custom VM — no WASM/EVM,
+  no cross-contract calls, no on-disk state. Playback is proven to
+  file sinks — no device audio sink, no compressed video codec,
+  no display sink. The web UI has no TLS or auth.
 - Grants, docs, or any deployment.
 
 ## Project laws (enforced by design, not just words)

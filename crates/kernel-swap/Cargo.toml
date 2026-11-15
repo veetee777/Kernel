@@ -1,0 +1,10 @@
+[package]
+name = "kernel-swap"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "KERNEL atomic swaps: hash-time-locked contracts (HTLC) over the local ledger"
+
+[dependencies]
+kernel-crypto = { path = "../kernel-crypto" }
+kernel-identity = { path = "../kernel-identity" }

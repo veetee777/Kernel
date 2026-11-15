@@ -17,12 +17,18 @@
 //! bytes.
 //!
 //! Nothing here decodes or plays video. This crate stores, verifies,
-//! and lists videos and their chunks. Playback is a separate concern.
+//! and lists videos and their chunks. Playback lives in [`playback`]:
+//! raw YUV420 frame streams (`KVFR`), conversion, scaling, and a
+//! frame-clocked player that presents to sinks such as
+//! [`playback::PpmSink`].
 //!
 //! Manifest format (explicit binary, no JSON):
 //! `KVIDEO1` + title length (u16 LE) + title bytes + duration (u64 LE)
 //! + width (u32 LE) + height (u32 LE) + chunk root CID (32) + owner
 //! public key (32) + signature (64).
+
+// The playback pipeline: KVFR decoding, YUV->RGB, scaling, player.
+pub mod playback;
 
 use std::collections::HashMap;
 use std::fmt;

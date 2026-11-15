@@ -30,6 +30,10 @@ members = [
     "crates/planet-k",
     "crates/x-koms",
     "crates/kernel-carrier",
+    "crates/kernel-nat",
+    "crates/kernel-swap",
+    "crates/kernel-contracts",
+    "crates/kernel-webui",
 ]
 
 [workspace.dependencies]

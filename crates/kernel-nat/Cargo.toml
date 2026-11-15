@@ -1,0 +1,10 @@
+[package]
+name = "kernel-nat"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "KERNEL NAT traversal: STUN-style address discovery, UDP hole punching, relay fallback"
+
+[dependencies]
+kernel-crypto = { path = "../kernel-crypto" }
+kernel-identity = { path = "../kernel-identity" }

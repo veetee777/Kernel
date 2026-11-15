@@ -242,6 +242,13 @@ impl Node {
         self.identity.public_identity()
     }
 
+    /// The CIDs of every block this node currently holds, in no
+    /// particular order. A read-only snapshot for status reporting
+    /// (for example, the web UI); it does not expose the bytes.
+    pub fn list_cids(&self) -> Vec<Cid> {
+        self.store.blocks().into_iter().map(|(cid, _)| cid).collect()
+    }
+
     /// Sign a message as this node.
     pub fn sign(&self, message: &[u8]) -> Ed25519Signature {
         self.identity.sign(message)
