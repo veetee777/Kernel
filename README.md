@@ -3,9 +3,10 @@
 Sovereign peer-to-peer infrastructure. A protocol, not a company-dependent
 hosting platform. Owner: Tristan Dene Bell.
 
-This directory is a **staging copy** of a from-scratch foundation rebuild.
-It is not the project's permanent home — that will be the owner's GitHub
-repo. Nothing here has been pushed, uploaded, or published anywhere.
+This is a from-scratch foundation rebuild. It lives at
+https://github.com/veetee777/Kernel — the owner's repo, not attached to
+any assistant. It is not the canonical workspace from the other session;
+that code is still locked behind that account's paywall.
 
 ## What exists
 
